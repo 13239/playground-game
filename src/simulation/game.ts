@@ -718,8 +718,18 @@ export class GameSimulation {
     value = 0,
   ): void {
     // 시각 효과 수만 제한한다. 피해·공격속도·성장 판정에는 이 제한을 적용하지 않는다.
-    if (Object.keys(this.state.effects).length >= 160) return;
+    // 집중 사격 중에도 처치 모션이 피격 스파크에 밀려 사라지지 않게 우선 표시한다.
+    if (Object.keys(this.state.effects).length >= 160) {
+      const expendable = (kind === "death" || kind === "boss-death")
+        ? Object.values(this.state.effects).find(effect => effect.kind === "hit")
+        : undefined;
+      if (!expendable) return;
+      delete this.state.effects[expendable.id];
+    }
     const id = this.nextId();
+    // 효과별 진행률을 클라이언트에서 동일하게 계산하며 공격 판정과 시각적 수명을 분리한다.
+    const duration = kind === "hit" ? 0.2 : kind === "death" ? 0.85 : kind === "boss-death" ? 1.1
+      : kind === "revive" ? 0.8 : kind === "stage-clear" ? 0.75 : 0.55;
     this.state.effects[id] = {
       id,
       kind,
@@ -727,23 +737,8 @@ export class GameSimulation {
       y,
       radius,
       value,
-      // 효과별 진행률을 클라이언트에서 동일하게 계산하며 공격 판정과 시각적 수명을 분리한다.
-      duration:
-        kind === "hit"
-          ? 0.2
-          : kind === "revive"
-            ? 0.8
-            : kind === "stage-clear"
-              ? 0.75
-              : 0.55,
-      life:
-        kind === "hit"
-          ? 0.2
-          : kind === "revive"
-            ? 0.8
-            : kind === "stage-clear"
-              ? 0.75
-              : 0.55,
+      duration,
+      life: duration,
     };
   }
   private nextId(): string {

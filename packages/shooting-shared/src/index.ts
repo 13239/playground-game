@@ -178,6 +178,17 @@ export type EnemyKind =
   | "boss-barrage"
   | "boss-artillery";
 export type PickupKind = "xp" | "heal" | "revive" | "invul";
+/** 공격 식별자와 범위를 공유해 서버 판정과 클라이언트 예고의 방향·크기를 일치시킨다. */
+export type EnemyAttack = "" | "shot" | "charge" | "artillery" | "melee"
+  | "boss-charge" | "boss-cleave" | "boss-fan" | "boss-ring"
+  | "boss-burst" | "boss-spiral" | "boss-mortar" | "boss-crossfire";
+export const BOSS_COMBAT = {
+  fanArc: 1.4,
+  cleaveRadius: 185,
+  cleaveHalfAngle: 1.2,
+  chargeSpeed: 850,
+  chargeSeconds: 0.55,
+} as const;
 export interface Rect {
   x: number;
   y: number;
@@ -218,6 +229,8 @@ export interface PlayerView {
 export interface EnemyView {
   id: string;
   kind: EnemyKind;
+  /** 구형 스냅샷에는 없을 수 있으며 연속 공격의 내부 타이머는 공개하지 않는다. */
+  attack?: EnemyAttack;
   x: number;
   y: number;
   angle: number;

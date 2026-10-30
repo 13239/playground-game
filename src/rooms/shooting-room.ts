@@ -196,7 +196,7 @@ export class ShootingRoom extends Room<{
         this.mode,
         false,
       );
-      // 일회용 티켓 외에도 사용자별·방별 비밀번호 시도 횟수를 제한한다.
+      // 일회용 코드 참가권이 없는 목록 입장은 사용자별·방별 비밀번호 시도 횟수도 제한한다.
       const now = Date.now();
       for (const [id, attempt] of this.passwordAttempts)
         if (attempt.expires <= now) this.passwordAttempts.delete(id);
@@ -204,7 +204,7 @@ export class ShootingRoom extends Room<{
         count: 0,
         expires: now + 60_000,
       };
-      if (this.settings.privateRoom) {
+      if (this.settings.privateRoom && identity.invitedRoomCode !== this.roomId) {
         if (++attempt.count > 5)
           throw new ServerError(
             429,

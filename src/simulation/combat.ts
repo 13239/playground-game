@@ -1,11 +1,13 @@
 import {
   WORLD,
+  BOSS_COMBAT,
   movement,
   weaponStats,
   type GameSnapshot,
   type PlayerView,
   type EnemyView,
   type EnemyKind,
+  type EnemyAttack,
   type BulletView,
   type HazardView,
   type Rect,
@@ -25,7 +27,11 @@ interface EnemyActor extends EnemyView {
   charging: number;
   chargeX: number;
   chargeY: number;
-  attack: string;
+  attack: EnemyAttack;
+  attackCycle: number;
+  volleyRemaining: number;
+  volleyWait: number;
+  attackStep: number;
 }
 interface BulletActor extends BulletView {
   damage: number;
@@ -79,6 +85,13 @@ const traits = {
   { health: number; speed: number; radius: number; ranged: boolean }
 >;
 
+/** 보스마다 네 패턴을 순환해 같은 공격만 반복하지 않고, 연속 공격도 서버 틱 안에서 끝낸다. */
+const bossPatterns = {
+  "boss-charge": ["boss-charge", "boss-fan", "boss-cleave", "boss-ring"],
+  "boss-barrage": ["boss-fan", "boss-burst", "boss-spiral", "boss-ring"],
+  "boss-artillery": ["boss-mortar", "boss-crossfire", "boss-burst", "boss-ring"],
+} as const satisfies Partial<Record<EnemyKind, readonly EnemyAttack[]>>;
+
 /** 전투 판정은 서버에서 고정 간격으로 수행한다. 네트워크 스키마와 Phaser 객체에 의존하지 않는다. */
 export class CombatWorld {
   private readonly enemies = new Map<string, EnemyActor>();
@@ -110,6 +123,12 @@ export class CombatWorld {
     this.collisionWalls = [...this.hooks.state.walls, ...this.boundaries()];
   }
   ceaseFire(): void {
+    // 클리어·종료 때 예약된 연사와 돌진도 취소해 이후 틱에서 다시 발사되지 않게 한다.
+    for (const enemy of this.enemies.values()) {
+      enemy.volleyRemaining = 0;
+      enemy.warning = 0;
+      enemy.charging = 0;
+    }
     for (const bullet of this.bullets.values()) this.recycle(bullet);
     this.bullets.clear();
     this.hazards.clear();
@@ -187,6 +206,10 @@ export class CombatWorld {
       chargeX: 0,
       chargeY: 0,
       attack: "",
+      attackCycle: 0,
+      volleyRemaining: 0,
+      volleyWait: 0,
+      attackStep: 0,
     };
     this.enemies.set(id, enemy);
     state.enemies[id] = enemy;
@@ -303,12 +326,18 @@ export class CombatWorld {
       enemy.x = next.x;
       enemy.y = next.y;
       enemy.charging -= dt;
-      // 돌진 종료 후의 보스 탄환도 현재 목표 방향 한 발로 통일한다.
-      if (enemy.charging <= 0 && enemy.boss)
-        this.hostileBullet(enemy, enemy.angle, 280);
+      // 돌진 뒤 보스는 부채꼴 후속 사격을 별도로 예고해 바로 앞의 플레이어도 회피할 수 있다.
+      if (enemy.charging <= 0 && enemy.boss) {
+        enemy.attack = "boss-fan";
+        enemy.targetX = target.x;
+        enemy.targetY = target.y;
+        enemy.warning = 0.75;
+      }
     } else if (enemy.warning > 0) {
       enemy.warning = Math.max(0, enemy.warning - dt);
       if (enemy.warning === 0) this.resolveAttack(enemy);
+    } else if (enemy.volleyRemaining > 0) {
+      this.advanceBossVolley(enemy, dt);
     } else {
       const ranged = traits[enemy.kind].ranged;
       const visible = this.navigation.visible(enemy, target, 5);
@@ -370,35 +399,34 @@ export class CombatWorld {
       const meleeSwing = enemy.kind === "brute" && dist < 120 && visible;
       if (
         enemy.cooldown <= 0 &&
-        (ranged
-          ? visible && dist < 700
-          : enemy.kind.includes("charge")
-            ? visible && dist < 620
-            : meleeSwing)
+        (enemy.boss
+          ? visible && dist < 850
+          : ranged
+            ? visible && dist < 700
+            : enemy.kind.includes("charge")
+              ? visible && dist < 620
+              : meleeSwing)
       ) {
         enemy.targetX = target.x;
         enemy.targetY = target.y;
-        enemy.warning = enemy.kind.includes("charge")
-          ? enemy.boss
-            ? 0.85
-            : 0.6
-          : enemy.boss
-            ? 0.6
-            : 0.4;
-        enemy.attack = enemy.kind.includes("charge")
-          ? "charge"
-          : enemy.kind.includes("artillery")
-            ? "artillery"
-            : enemy.kind === "boss-barrage"
-              ? "barrage"
+        if (enemy.boss) {
+          const patterns = bossPatterns[enemy.kind as keyof typeof bossPatterns];
+          enemy.attack = patterns[enemy.attackCycle++ % patterns.length];
+          enemy.warning = enemy.attack === "boss-charge" ? 0.95 : 0.8;
+        } else {
+          enemy.warning = enemy.kind.includes("charge") ? 0.6 : 0.4;
+          enemy.attack = enemy.kind.includes("charge")
+            ? "charge"
+            : enemy.kind.includes("artillery")
+              ? "artillery"
               : meleeSwing
                 ? "melee"
                 : "shot";
-        enemy.cooldown = Math.max(
-          0.7,
-          (enemy.boss ? 1.65 : 2.0) /
-            (1 + Math.log2(this.hooks.state.stage + 1) * 0.12),
-        );
+          enemy.cooldown = Math.max(
+            0.7,
+            2 / (1 + Math.log2(this.hooks.state.stage + 1) * 0.12),
+          );
+        }
       }
     }
     for (const player of players)
@@ -414,19 +442,15 @@ export class CombatWorld {
 
   private resolveAttack(enemy: EnemyActor): void {
     const angle = Math.atan2(enemy.targetY - enemy.y, enemy.targetX - enemy.x);
-    if (enemy.attack === "charge") {
-      enemy.charging = enemy.boss ? 0.55 : 0.38;
-      enemy.chargeX = Math.cos(angle) * (enemy.boss ? 850 : 690);
-      enemy.chargeY = Math.sin(angle) * (enemy.boss ? 850 : 690);
+    if (enemy.boss) {
+      this.resolveBossAttack(enemy, angle);
+    } else if (enemy.attack === "charge") {
+      enemy.charging = 0.38;
+      enemy.chargeX = Math.cos(angle) * 690;
+      enemy.chargeY = Math.sin(angle) * 690;
     } else if (enemy.attack === "artillery") {
-      // 보스도 한 공격당 포격 지점 하나만 생성해 여러 갈래 공격을 동시에 피하지 않게 한다.
+      // 일반 포격병은 한 지점, 보스는 별도의 다중 포격 패턴으로 역할을 구분한다.
       this.artillery(enemy, enemy.targetX, enemy.targetY);
-    } else if (enemy.attack === "barrage") {
-      this.hostileBullet(
-        enemy,
-        angle,
-        250 + Math.log2(this.hooks.state.stage + 1) * 15,
-      );
     } else if (enemy.attack === "melee") {
       // 중장갑 근접병은 예고한 방향으로 한 번 휘두른다. 멀리 빠지거나 뒤로 돌아 피할 수 있다.
       this.hooks.effect("melee-swipe", enemy.x, enemy.y, 110, angle);
@@ -442,6 +466,88 @@ export class CombatWorld {
     } else {
       // 일반 몬스터는 조준 방향으로 한 발만 발사해 세 갈래 탄환의 회피 부담을 줄인다.
       this.hostileBullet(enemy, angle, 350);
+    }
+  }
+
+  private resolveBossAttack(enemy: EnemyActor, angle: number): void {
+    const enraged = enemy.hp <= enemy.maxHp * 0.5;
+    enemy.cooldown = enraged ? 0.95 : 1.3;
+    if (enemy.attack === "boss-charge") {
+      enemy.charging = BOSS_COMBAT.chargeSeconds;
+      enemy.chargeX = Math.cos(angle) * BOSS_COMBAT.chargeSpeed;
+      enemy.chargeY = Math.sin(angle) * BOSS_COMBAT.chargeSpeed;
+    } else if (enemy.attack === "boss-fan") {
+      this.fan(enemy, angle, enraged ? 9 : 7, BOSS_COMBAT.fanArc, 290);
+    } else if (enemy.attack === "boss-ring") {
+      const count = enraged ? 16 : 12;
+      for (let i = 0; i < count; i++)
+        this.hostileBullet(enemy, angle + (i + 0.5) * Math.PI * 2 / count, 235);
+    } else if (enemy.attack === "boss-cleave") {
+      const { cleaveRadius: radius, cleaveHalfAngle } = BOSS_COMBAT;
+      this.hooks.effect("melee-swipe", enemy.x, enemy.y, radius, angle);
+      for (const player of this.targets) {
+        const toward = Math.atan2(player.y - enemy.y, player.x - enemy.x);
+        if (
+          distanceSquared(enemy, player) <= radius ** 2 &&
+          Math.cos(toward - angle) >= Math.cos(cleaveHalfAngle) &&
+          this.navigation.visible(enemy, player, 0)
+        )
+          this.hooks.hitPlayer(player, enemy.damage * 1.35);
+      }
+    } else {
+      // 최대 18회만 예약하며 별도 타이머·클로저를 만들지 않는다. 일시정지 시 시뮬레이션과 함께 멈춘다.
+      enemy.attackStep = 0;
+      enemy.volleyWait = 0;
+      enemy.volleyRemaining = enemy.attack === "boss-spiral"
+        ? (enraged ? 18 : 12)
+        : enemy.attack === "boss-burst"
+          ? (enraged ? 4 : 3)
+          : (enraged ? 7 : 5);
+      this.advanceBossVolley(enemy, 0);
+    }
+  }
+
+  private fan(
+    enemy: EnemyActor, angle: number, count: number, arc: number, speed: number,
+  ): void {
+    for (let i = 0; i < count; i++)
+      this.hostileBullet(enemy, angle + (i / (count - 1) - 0.5) * arc, speed);
+  }
+
+  private advanceBossVolley(enemy: EnemyActor, dt: number): void {
+    enemy.volleyWait -= dt;
+    // 큰 틱이 들어와도 한꺼번에 무제한 발사하지 않으며 정상 고정 틱에서는 발사 간격을 보존한다.
+    for (
+      let emitted = 0;
+      enemy.volleyRemaining > 0 && enemy.volleyWait <= 0 && emitted < 4;
+      emitted++
+    ) {
+      const angle = Math.atan2(enemy.targetY - enemy.y, enemy.targetX - enemy.x);
+      const step = enemy.attackStep++;
+      if (enemy.attack === "boss-burst") {
+        this.fan(enemy, angle + (step % 2 ? 0.07 : -0.07), 3, 0.32, 360);
+        enemy.volleyWait += 0.2;
+      } else if (enemy.attack === "boss-spiral") {
+        this.hostileBullet(enemy, angle + step * 0.43, 245);
+        this.hostileBullet(enemy, angle + step * 0.43 + Math.PI, 245);
+        enemy.volleyWait += 0.11;
+      } else {
+        // 중심→주변 또는 십자 순서로 낙하한다. 각 지점은 생성 후 0.9초를 온전히 예고한다.
+        const offset = step === 0 ? 0
+          : enemy.attack === "boss-crossfire" ? 180 * Math.ceil(step / 4) : 185;
+        const direction = enemy.attack === "boss-crossfire"
+          ? angle + (step - 1) * Math.PI / 2
+          : angle + (step - 1) * Math.PI / 3;
+        this.artillery(
+          enemy,
+          enemy.targetX + Math.cos(direction) * offset,
+          enemy.targetY + Math.sin(direction) * offset,
+        );
+        enemy.volleyWait += 0.18;
+      }
+      enemy.volleyRemaining--;
+      if (enemy.volleyRemaining === 0)
+        enemy.cooldown = enemy.hp <= enemy.maxHp * 0.5 ? 0.95 : 1.3;
     }
   }
 
@@ -464,11 +570,13 @@ export class CombatWorld {
   }
   private artillery(enemy: EnemyActor, x: number, y: number): void {
     const id = this.hooks.nextId();
+    const radius = enemy.boss ? 90 : 76;
     const hazard: HazardActor = {
       id,
-      x,
-      y: Math.max(75, Math.min(WORLD.height - 75, y)),
-      radius: enemy.boss ? 100 : 76,
+      // 경계에서도 원 전체와 예고가 보이도록 실제 판정 위치를 함께 제한한다.
+      x: Math.max(WORLD.border + radius, Math.min(WORLD.width - WORLD.border - radius, x)),
+      y: Math.max(WORLD.border + radius, Math.min(WORLD.height - WORLD.border - radius, y)),
+      radius,
       warning: 0.9,
       life: 0.3,
       kind: "artillery",

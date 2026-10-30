@@ -14,6 +14,8 @@ export interface Identity {
   mode: Mode;
   origin: string;
   proofRequired: boolean;
+  // Spring이 발급한 일회용 티켓에 묶인 비밀번호 없는 코드 입장 대상이다.
+  invitedRoomCode?: string;
 }
 export interface Lease {
   userId: number;

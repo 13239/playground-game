@@ -55,7 +55,8 @@ const Player = schema(
 );
 const Enemy = schema(
   {
-    ...strings("id", "kind"),
+    // 공격 종류도 전송해 같은 보스의 돌진·탄막·포격 예고를 구분한다.
+    ...strings("id", "kind", "attack"),
     ...numbers(
       "x",
       "y",
@@ -146,6 +147,7 @@ const entityFields = {
   enemies: [
     "id",
     "kind",
+    "attack",
     "x",
     "y",
     "angle",

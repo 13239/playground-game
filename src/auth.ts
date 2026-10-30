@@ -98,6 +98,9 @@ export async function authenticate(
     (!identity.proofRequired &&
       (!config.allowDevHttp || thumbprint !== "dev-http")) ||
     (identity.proofRequired && thumbprint === "dev-http")
+    // 클라이언트 options의 플래그를 믿지 않고 인증 서버가 티켓에 기록한 정확한 방만 허용한다.
+    || (identity.invitedRoomCode != null &&
+      (creating || mode !== "COOP" || identity.invitedRoomCode !== roomId))
   )
     throw new Error("Invalid connection.");
   return identity;
