@@ -1,6 +1,8 @@
 /** 렌더러·네트워크·서버가 같은 규칙을 사용하며 서버 전용 인증 정보는 이 패키지에 넣지 않는다. */
-export const RULE_VERSION = 3;
+// 버전 5는 짧은 대시·패턴 공략 전투다. 과거 별·해금은 보존하고 랭킹은 현재 버전만 비교한다.
+export const RULE_VERSION = 5;
 export * from "./stages.ts";
+export * from "./encounters.ts";
 import type { StageMapId, ShootingCharacterId, StageDevice } from "./stages.ts";
 export const WORLD = {
   width: 1600,
@@ -149,9 +151,10 @@ export const BALANCE = {
   baseSpeed: 265,
   baseArmor: 0,
   armorUnit: 100,
-  dashDistance: 165,
-  dashDuration: 0.17,
-  dashCooldown: 3,
+  // 짧은 연속 회피를 허용하되 대시 자체에 무적은 부여하지 않는다.
+  dashDistance: 95,
+  dashDuration: 0.1,
+  dashCooldown: 0.3,
   hitProtection: 0.5,
   revivalProtection: 1,
   revivalHealth: 0.5,
@@ -183,6 +186,8 @@ export type EnemyKind =
   | "artillery"
   | "brute"
   | "skirmisher"
+  | "sniper"
+  | "support"
   | "boss-charge"
   | "boss-barrage"
   | "boss-artillery";
@@ -191,6 +196,7 @@ export type PickupKind = "xp" | "heal" | "revive" | "invul";
 export type EnemyAttack =
   | ""
   | "shot"
+  | "snipe"
   | "charge"
   | "artillery"
   | "melee"
@@ -203,6 +209,9 @@ export type EnemyAttack =
   | "boss-mortar"
   | "boss-crossfire";
 export const BOSS_COMBAT = {
+  // 서버의 지원 분대 호출·광폭화와 클라이언트의 탄막 예고가 같은 체력 구간을 따른다.
+  secondPhaseHealth: 0.65,
+  finalPhaseHealth: 0.35,
   fanArc: 1.4,
   cleaveRadius: 185,
   cleaveHalfAngle: 1.2,
@@ -245,6 +254,8 @@ export interface PlayerView {
   dashCooldown: number;
   invulCooldown: number;
   protection: number;
+  /** 아이템 실드만 별도 동기화한다. 피격·부활 보호를 무적 아이템 사용으로 오인하지 않는다. */
+  shieldRemaining: number;
   dashRemaining: number;
   clearedStage: number;
   clearMillis: number;
@@ -261,6 +272,10 @@ export interface EnemyView {
   maxHp: number;
   radius: number;
   warning: number;
+  /** 총 예고 시간·정예 여부·보스 단계도 서버와 같은 시각 신호를 사용한다. */
+  windup: number;
+  elite: boolean;
+  combatPhase: number;
   targetX: number;
   targetY: number;
   spawnRemaining: number;
@@ -323,6 +338,7 @@ export interface GameSnapshot {
   xp: number;
   nextXp: number;
   combatMillis: number;
+  stageMillis: number;
   clearedStage: number;
   clearMillis: number;
   deadline: number;

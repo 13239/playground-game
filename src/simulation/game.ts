@@ -3,6 +3,8 @@ import {
   STAGE_MAPS,
   STAGES_PER_MAP,
   stageLayout,
+  encounterFor,
+  terrainSpeed,
   mapStars,
   mapUnlocked,
   isStageMap,
@@ -75,6 +77,7 @@ export class GameSimulation {
       xp: 0,
       nextXp: 98,
       combatMillis: 0,
+      stageMillis: 0,
       clearedStage: 0,
       clearMillis: 0,
       deadline: 0,
@@ -151,6 +154,7 @@ export class GameSimulation {
       dashCooldown: 0,
       invulCooldown: 0,
       protection: 0,
+      shieldRemaining: 0,
       dashRemaining: 0,
       clearedStage: 0,
       clearMillis: 0,
@@ -314,6 +318,7 @@ export class GameSimulation {
       target.alive = true;
       target.hp = target.maxHp * BALANCE.revivalHealth;
       target.protection = BALANCE.revivalProtection;
+      target.shieldRemaining = 0;
       if (target.id !== player.id) {
         target.x = player.x;
         target.y = player.y;
@@ -330,6 +335,7 @@ export class GameSimulation {
       player.invuls--;
       player.invulCooldown = BALANCE.invulnerabilityCooldown;
       player.protection = Math.max(player.protection, BALANCE.invulnerability);
+      player.shieldRemaining = BALANCE.invulnerability;
       this.effect("invul", player.x, player.y, 55);
       return;
     }
@@ -338,9 +344,9 @@ export class GameSimulation {
       const vector = control.frame,
         length = Math.hypot(vector.moveX, vector.moveY);
       control.dashX =
-        length > 0.01 ? vector.moveX / length : Math.cos(player.aim);
+        control.age < BALANCE.inputTimeout && length > 0.01 ? vector.moveX / length : Math.cos(player.aim);
       control.dashY =
-        length > 0.01 ? vector.moveY / length : Math.sin(player.aim);
+        control.age < BALANCE.inputTimeout && length > 0.01 ? vector.moveY / length : Math.sin(player.aim);
       player.dashRemaining = BALANCE.dashDuration;
       player.dashCooldown = BALANCE.dashCooldown;
       return;
@@ -430,6 +436,7 @@ export class GameSimulation {
     for (const player of this.activePlayers()) this.advancePlayer(player, dt);
     if (this.state.phase === "combat") {
       this.state.combatMillis += dt * 1000;
+      this.state.stageMillis += dt * 1000;
       for (const player of this.activePlayers()) {
         const control = this.controls.get(player.id)!;
         this.combat.fire(
@@ -439,10 +446,19 @@ export class GameSimulation {
         );
       }
       this.combat.step(dt);
+      const plan = encounterFor(this.state.stage);
+      const devicesAlive = Object.values(this.state.devices).some((device) => device.kind !== "pillar" && device.hp > 0);
+      // 시간 초과는 임의 피해가 아니라 명확한 목표 실패로 종료한다. 정지·강화 중에는 시간이 흐르지 않는다.
+      if (plan.goal === "disrupt" && devicesAlive && this.state.stageMillis >= plan.limit * 1000) {
+        this.state.notice = "장치 가동을 막지 못했어요. 장치부터 제압하고 다시 도전하세요.";
+        this.end();
+        return;
+      }
       if (
-        this.bossDefeated ||
+        (this.bossDefeated ||
         (this.state.enemiesSpawned >= this.state.enemyTotal &&
-          this.combat.size === 0)
+          this.combat.size === 0)) &&
+        (!(plan.goal === "devices" || plan.goal === "disrupt") || !devicesAlive)
       )
         this.clearStage();
       else if (
@@ -469,6 +485,7 @@ export class GameSimulation {
     player.dashCooldown = Math.max(0, player.dashCooldown - dt);
     player.invulCooldown = Math.max(0, player.invulCooldown - dt);
     player.protection = Math.max(0, player.protection - dt);
+    player.shieldRemaining = Math.max(0, player.shieldRemaining - dt);
     player.armor = playerStats(this.state.level).armor;
     player.vx = 0;
     player.vy = 0;
@@ -491,7 +508,8 @@ export class GameSimulation {
       player.y = next.y;
       player.dashRemaining = Math.max(0, player.dashRemaining - dt);
     } else if (control.age < BALANCE.inputTimeout) {
-      const speed = playerStats(this.state.level).speed;
+      // 이동 둔화만 적용하며 대시는 원래 거리를 유지해 위험 구역을 벗어날 수 있게 한다.
+      const speed = playerStats(this.state.level).speed * terrainSpeed(player.x, player.y, Object.values(this.state.devices));
       player.vx = control.frame.moveX * speed;
       player.vy = control.frame.moveY * speed;
       const next = movement(
@@ -532,6 +550,7 @@ export class GameSimulation {
     // 맵은 10스테이지에서 완결한다. 자동으로 다음 맵이나 무한 도전에 진입하지 않는다.
     if (this.state.stage >= STAGES_PER_MAP) return;
     this.state.stage++;
+    this.state.stageMillis = 0;
     this.state.phase = "combat";
     this.state.deadline = 0;
     this.state.enemiesSpawned = 0;
@@ -554,6 +573,7 @@ export class GameSimulation {
       player.dashCooldown = 0;
       player.invulCooldown = 0;
       player.protection = 0;
+      player.shieldRemaining = 0;
       player.dashRemaining = 0;
       player.vx = 0;
       player.vy = 0;
@@ -571,17 +591,15 @@ export class GameSimulation {
       this.state.waveCount = 1;
       this.state.wave = 1;
       this.combat.spawn(map.bossKind);
+      const roles = encounterFor(this.state.stage).roles;
       for (let index = 0; index < this.ordinaryTotal; index++)
-        this.combat.spawn(map.ordinary[index % map.ordinary.length]);
+        this.combat.spawn(roles[index % roles.length]);
     } else {
       this.state.bossName = "";
-      this.ordinaryTotal = Math.ceil(
-        (14 + 2 * this.state.stage) * (this.state.mode === "COOP" ? 1.6 : 1),
-      );
-      this.waveSize = Math.ceil(
-        (8 + Math.floor(this.state.stage / 3)) *
-          (this.state.mode === "COOP" ? 1.5 : 1),
-      );
+      // 수보다 조합을 우선한다. 작은 분대로 압박과 반격의 리듬을 만들고 9스테이지에서 종합한다.
+      const plan = encounterFor(this.state.stage);
+      this.ordinaryTotal = Math.ceil(plan.enemies * (this.state.mode === "COOP" ? 1.5 : 1));
+      this.waveSize = Math.ceil(plan.pack * (this.state.mode === "COOP" ? 1.4 : 1));
       this.state.enemyTotal = this.ordinaryTotal;
       this.state.waveCount = Math.ceil(this.ordinaryTotal / this.waveSize);
       this.spawnWave();
@@ -595,10 +613,11 @@ export class GameSimulation {
     );
     if (count <= 0) return;
     this.state.wave++;
-    const kinds = STAGE_MAPS[this.state.mapId].ordinary;
+    const kinds = [...new Set<EnemyView["kind"]>([...encounterFor(this.state.stage).roles, ...STAGE_MAPS[this.state.mapId].ordinary])];
     for (let index = 0; index < count; index++)
       this.combat.spawn(
-        kinds[(this.state.enemiesSpawned + this.state.stage) % kinds.length],
+        kinds[this.state.enemiesSpawned % kinds.length],
+        (this.state.stage === 4 || this.state.stage === 9) && index % 3 === 1,
       );
   }
   private clearStage(): void {
@@ -683,7 +702,7 @@ export class GameSimulation {
     this.state.xp += experience;
   }
 
-  /** 자동 경험치를 레벨로 변환하며 클리어 전환 상태도 강화 이후 정확히 이어간다. */
+  /** 자동 경험치는 즉시 성장으로 반영하되 강화 선택은 클리어 전환에 모아 전투 리듬을 끊지 않는다. */
   private applyExperience(): void {
     if (this.state.phase === "over") return;
     while (this.state.xp >= this.state.nextXp) {
@@ -701,7 +720,7 @@ export class GameSimulation {
       this.pendingLevels++;
       this.state.nextXp = 70 + this.state.level * 28;
     }
-    if (this.pendingLevels > 0 && this.state.phase !== "upgrade") {
+    if (this.pendingLevels > 0 && this.state.phase === "loot") {
       this.resumePhase = this.state.phase;
       this.resumeDeadline = this.state.deadline;
       this.state.phase = "upgrade";
@@ -792,7 +811,7 @@ export class GameSimulation {
     const id = this.nextId();
     // 효과별 진행률을 클라이언트에서 동일하게 계산하며 공격 판정과 시각적 수명을 분리한다.
     const duration =
-      kind === "hit"
+      kind === "enemy-shot" ? 0.12 : kind === "invul" ? 0.8 : kind === "boss-phase" ? 0.9 : kind === "hit"
         ? 0.2
         : kind === "death"
           ? 0.85

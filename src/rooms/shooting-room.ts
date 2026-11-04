@@ -4,6 +4,7 @@ import {
   BALANCE,
   RULE_VERSION,
   STAGE_MAPS,
+  STAGE_MAP_IDS,
   isStageMap,
   mapUnlocked,
   WORLD,
@@ -555,7 +556,8 @@ export class ShootingRoom extends Room<{
             player.clearedStage === 10
           ) {
             const next = STAGE_MAPS[this.simulation.state.mapId].order + 1;
-            if (next < 3) player.unlockedMaps |= 1 << next;
+            // 마지막 맵을 제외한 모든 완주는 카탈로그의 다음 맵을 연다.
+            if (next < STAGE_MAP_IDS.length) player.unlockedMaps |= 1 << next;
           }
           this.clients
             .find((client) => client.sessionId === player.id)

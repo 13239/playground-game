@@ -1,5 +1,6 @@
 import { createHash, webcrypto } from "node:crypto";
 import {
+  ALL_MAPS,
   connectionMessage,
   isStageMap,
   type Mode,
@@ -102,7 +103,7 @@ export async function authenticate(
     !isStageMap(identity.mapId) ||
     !Number.isInteger(identity.unlockedMaps) ||
     identity.unlockedMaps < 1 ||
-    identity.unlockedMaps > 7 ||
+    identity.unlockedMaps > ALL_MAPS ||
     typeof identity.nickname !== "string" ||
     typeof identity.proofRequired !== "boolean" ||
     (!identity.proofRequired &&
