@@ -20,9 +20,10 @@ const booleans = <K extends string>(...names: K[]) =>
 /** 최신 필드 빌더를 사용하며 인증 신원은 스키마에 정의하지 않아 브라우저로 직렬화되지 않는다. */
 const Player = schema(
   {
-    ...strings("id", "nickname", "avatar", "weapon"),
+    ...strings("id", "nickname", "avatar", "weapon", "character"),
     ...numbers(
       "color",
+      "unlockedMaps",
       "x",
       "y",
       "vx",
@@ -68,6 +69,7 @@ const Enemy = schema(
       "targetX",
       "targetY",
       "spawnRemaining",
+      "exposed",
     ),
     ...booleans("boss"),
   },
@@ -103,6 +105,11 @@ const Wall = schema(
   { ...numbers("x", "y", "width", "height") },
   "ShootingWall",
 );
+/** 공략 장치도 서버가 판정한 체력·위치만 전송한다. */
+const Device = schema(
+  { ...strings("id", "kind"), ...numbers("x", "y", "radius", "hp", "maxHp") },
+  "ShootingDevice",
+);
 export const WorldState = schema(
   {
     ...strings(
@@ -113,6 +120,8 @@ export const WorldState = schema(
       "notice",
       "hostId",
       "title",
+      "mapId",
+      "nextMapId",
     ),
     ...numbers(
       "stage",
@@ -129,8 +138,11 @@ export const WorldState = schema(
       "enemiesKilled",
       "wave",
       "waveCount",
+      "stars",
     ),
-    ...booleans("paused", "privateRoom"),
+    ...booleans("paused", "privateRoom", "completed"),
+    devices: t.map(Device),
+    stageTimes: t.array("number"),
     players: t.map(Player),
     enemies: t.map(Enemy),
     bullets: t.map(Bullet),
@@ -158,17 +170,21 @@ const entityFields = {
     "targetX",
     "targetY",
     "spawnRemaining",
+    "exposed",
     "boss",
   ],
   bullets: ["id", "weapon", "owner", "x", "y", "vx", "vy", "radius", "hostile"],
   pickups: ["id", "kind", "x", "y", "amount"],
   hazards: ["id", "kind", "x", "y", "radius", "warning", "life"],
   effects: ["id", "kind", "x", "y", "radius", "life", "value", "duration"],
+  devices: ["id", "kind", "x", "y", "radius", "hp", "maxHp"],
 } as const;
 const playerFields = [
   "id",
   "nickname",
   "avatar",
+  "character",
+  "unlockedMaps",
   "weapon",
   "color",
   "x",
@@ -204,6 +220,10 @@ export function synchronize(
   const root = state as unknown as Record<string, unknown>;
   for (const name of [
     "hostId",
+    "mapId",
+    "nextMapId",
+    "completed",
+    "stars",
     "title",
     "privateRoom",
     "phase",
@@ -247,6 +267,7 @@ export function synchronize(
     pickups: Pickup,
     hazards: Hazard,
     effects: Effect,
+    devices: Device,
   };
   for (const name of Object.keys(
     constructors,
@@ -264,6 +285,10 @@ export function synchronize(
           value as unknown as Record<string, unknown>
         )[field];
     }
+  }
+  if (state.stageTimes.length !== snapshot.stageTimes.length) {
+    state.stageTimes.clear();
+    for (const time of snapshot.stageTimes) state.stageTimes.push(time);
   }
   // 같은 위치에 배치되어도 스테이지마다 달라진 엄폐물 크기를 함께 동기화한다.
   if (

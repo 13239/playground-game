@@ -3,9 +3,11 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest, Agent } from "node:https";
 import { readFileSync } from "node:fs";
 import { config } from "./config.ts";
-import type { Mode } from "@playground/shooting-shared";
+import type { Mode, StageMapId } from "@playground/shooting-shared";
 
 export interface Identity {
+  mapId: StageMapId;
+  unlockedMaps: number;
   userId: number;
   sessionId: string;
   browserKey: string;
@@ -24,6 +26,9 @@ export interface Lease {
   roomId: string;
 }
 export interface Checkpoint {
+  mapId: StageMapId;
+  ruleVersion: number;
+  completed: boolean;
   runId: string;
   userId: number;
   sessionId: string;
@@ -64,7 +69,9 @@ export async function backend<T = void>(
     | "release"
     | "checkpoint"
     | "lobby"
-    | "restart",
+    | "restart"
+    | "progress",
+  // 맵 해금은 신뢰된 내부 진행 조회로 다시 확인한다.
   input: object,
 ): Promise<T> {
   const path = `/internal/shooting/${operation}`;
@@ -132,16 +139,22 @@ export async function backend<T = void>(
 /** 클리어마다 기록을 저장한다. 지연된 갱신은 직렬 재시도로 처리하고 종료 기록을 뒤로 밀지 않는다. */
 export class RecordWriter {
   private readonly pending = new Map<string, Checkpoint>();
+  private readonly listeners = new Map<string, Set<(saved: boolean) => void>>();
   private running = false;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private attempts = 0;
-  queue(value: Checkpoint): void {
+  queue(value: Checkpoint): Promise<boolean> {
     // 이전 도전의 지연된 종료 기록과 새 도전이 같은 계정이라는 이유로 덮어쓰이지 않게 한다.
     const id = `${value.runId}:${value.userId}`;
     const prior = this.pending.get(id);
-    if (prior?.finished) return;
-    this.pending.set(id, value);
+    if (!prior?.finished) this.pending.set(id, value);
+    const completion = new Promise<boolean>((resolve) => {
+      const listeners = this.listeners.get(id) ?? new Set();
+      listeners.add(resolve);
+      this.listeners.set(id, listeners);
+    });
     void this.drain();
+    return completion;
   }
   private async drain(): Promise<void> {
     if (this.running || this.timer || this.pending.size === 0) return;
@@ -150,7 +163,10 @@ export class RecordWriter {
       for (const [id, value] of this.pending) {
         try {
           await backend("checkpoint", value);
-          if (this.pending.get(id) === value) this.pending.delete(id);
+          if (this.pending.get(id) === value) {
+            this.pending.delete(id);
+            this.settled(id, true);
+          }
           this.attempts = 0;
         } catch (error) {
           // 만료된 세션·잘못된 입력은 재전송하지 않는다. 이미 저장한 마지막 클리어는 유지된다.
@@ -159,7 +175,10 @@ export class RecordWriter {
             error.status >= 400 &&
             error.status < 500
           ) {
-            if (this.pending.get(id) === value) this.pending.delete(id);
+            if (this.pending.get(id) === value) {
+              this.pending.delete(id);
+              this.settled(id, false);
+            }
             continue;
           }
           const delay = Math.min(
@@ -178,5 +197,10 @@ export class RecordWriter {
       this.running = false;
       if (!this.timer && this.pending.size) void this.drain();
     }
+  }
+  /** 새 맵 출격은 최종 기록의 저장 확인 뒤 진행한다. 중간 갱신은 마지막 갱신에 합쳐진다. */
+  private settled(id: string, saved: boolean): void {
+    for (const listener of this.listeners.get(id) ?? []) listener(saved);
+    this.listeners.delete(id);
   }
 }

@@ -2,6 +2,10 @@ import { createHash, randomInt, randomUUID } from "node:crypto";
 import { Room, ServerError, type Client, type AuthContext } from "colyseus";
 import {
   BALANCE,
+  RULE_VERSION,
+  STAGE_MAPS,
+  isStageMap,
+  mapUnlocked,
   WORLD,
   type Mode,
   type PlayerView,
@@ -52,6 +56,7 @@ export class ShootingRoom extends Room<{
   private validating = false;
   private restarting = false;
   private disposed = false;
+  private readonly saves = new Map<string, Promise<boolean>>();
   private lobbyUpdates: Promise<void> = Promise.resolve();
   private settings!: RoomSettings;
   private lobbyOwner?: Identity;
@@ -100,10 +105,14 @@ export class ShootingRoom extends Room<{
       .digest("hex");
     activeRooms++;
     this.counted = true;
-    this.simulation = new GameSimulation(this.mode, {
-      random: () => randomInt(0x100000000) / 0x100000000,
-      record: (player, finished) => this.record(player, finished),
-    });
+    this.simulation = new GameSimulation(
+      this.mode,
+      {
+        random: () => randomInt(0x100000000) / 0x100000000,
+        record: (player, finished) => this.record(player, finished),
+      },
+      this.creator.mapId,
+    );
     this.applySettings();
     // 명시적 퇴장은 사용권을 반환한 뒤 확인 응답을 보내 즉시 재참가와 경합하지 않게 한다.
     this.onMessage("leave", (client) => {
@@ -138,13 +147,25 @@ export class ShootingRoom extends Room<{
           player &&
           player.connected &&
           !player.departed
-        )
+        ) {
+          const target =
+            (value as { mapId?: unknown }).mapId ?? this.simulation.state.mapId;
+          if (!isStageMap(target)) return;
+          if (this.simulation.state.nextMapId !== target) {
+            for (const member of Object.values(this.simulation.state.players))
+              member.vote = false;
+            this.simulation.state.nextMapId = target;
+          }
           player.vote = true;
+        }
         void this.replay();
         return;
       }
       const before = this.simulation.state.phase;
+      const previousMap = this.simulation.state.mapId;
       this.simulation.action(client.sessionId, value);
+      // 대기실의 맵 변경은 목록에도 즉시 반영해 이전 맵으로 참가를 시도하지 않게 한다.
+      if (previousMap !== this.simulation.state.mapId) void this.publishLobby();
       if (before === "lobby" && this.simulation.state.phase !== "lobby") {
         void this.lock();
         void this.publishLobby();
@@ -196,6 +217,8 @@ export class ShootingRoom extends Room<{
         this.mode,
         false,
       );
+      if (!mapUnlocked(identity.unlockedMaps, this.simulation.state.mapId))
+        throw new ServerError(403, "이 맵을 먼저 해금한 뒤 참가해 주세요.");
       // 일회용 코드 참가권이 없는 목록 입장은 사용자별·방별 비밀번호 시도 횟수도 제한한다.
       const now = Date.now();
       for (const [id, attempt] of this.passwordAttempts)
@@ -204,7 +227,10 @@ export class ShootingRoom extends Room<{
         count: 0,
         expires: now + 60_000,
       };
-      if (this.settings.privateRoom && identity.invitedRoomCode !== this.roomId) {
+      if (
+        this.settings.privateRoom &&
+        identity.invitedRoomCode !== this.roomId
+      ) {
         if (++attempt.count > 5)
           throw new ServerError(
             429,
@@ -263,6 +289,7 @@ export class ShootingRoom extends Room<{
       client.sessionId,
       identity.nickname,
       identity.avatar,
+      identity.unlockedMaps,
     );
     synchronize(this.state, this.simulation.state);
     // 최초 참가가 확인된 방만 공개하고, 참가 인원이 바뀔 때 목록의 좌석도 함께 갱신한다.
@@ -375,6 +402,7 @@ export class ShootingRoom extends Room<{
           roomId: this.roomId,
           runId: this.runId,
           open,
+          mapId: this.simulation.state.mapId,
           title: this.settings.title,
           privateRoom: this.settings.privateRoom,
         });
@@ -409,35 +437,73 @@ export class ShootingRoom extends Room<{
       return;
     this.restarting = true;
     try {
+      // 클리어 저장이 끝나기 전에 다음 맵 권한을 읽어 잠긴 맵으로 오판하지 않는다.
+      const saved = await Promise.race([
+        Promise.all(
+          players.map(
+            (player) => this.saves.get(player.id) ?? Promise.resolve(true),
+          ),
+        ).then((values) => values.every(Boolean)),
+        new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), 8000);
+          timer.unref();
+        }),
+      ]);
+      if (!saved)
+        throw new Error(
+          "기록 저장을 확인하고 있어요. 잠시 후 다시 도전해 주세요.",
+        );
       await backend("restart", { mode: this.mode });
+      const selectedMap = this.simulation.state.nextMapId;
       for (const player of players) {
         const identity = this.identities.get(player.id);
         if (!identity) return;
-        await backend("validate", this.lease(identity));
+        const progress = await backend<{ unlockedMaps: number }>(
+          "progress",
+          this.lease(identity),
+        );
+        identity.unlockedMaps = progress.unlockedMaps;
+        if (!mapUnlocked(identity.unlockedMaps, selectedMap))
+          throw new Error("두 사람 모두 해금한 맵만 출격할 수 있어요.");
       }
       // 확인 중 퇴장·재접속이 발생한 이전 참가자를 새 도전에 다시 넣지 않는다.
       if (players.some((p) => p.departed || !p.connected)) return;
       // 이전 도전에서 떠난 참가자의 신원을 새 도전 기록의 팀원으로 잘못 사용하지 않는다.
       const activeIds = new Set(players.map((p) => p.id));
-      for (const id of this.identities.keys()) if (!activeIds.has(id)) this.identities.delete(id);
+      for (const id of this.identities.keys())
+        if (!activeIds.has(id)) this.identities.delete(id);
       this.runId = randomUUID();
-      this.simulation = new GameSimulation(this.mode, {
-        random: () => randomInt(0x100000000) / 0x100000000,
-        record: (value, finished) => this.record(value, finished),
-      });
+      this.simulation = new GameSimulation(
+        this.mode,
+        {
+          random: () => randomInt(0x100000000) / 0x100000000,
+          record: (value, finished) => this.record(value, finished),
+        },
+        selectedMap,
+      );
       this.applySettings();
-      for (const member of players)
-        this.simulation.addPlayer(member.id, member.nickname, member.avatar);
+      for (const member of players) {
+        this.simulation.addPlayer(
+          member.id,
+          member.nickname,
+          member.avatar,
+          this.identities.get(member.id)!.unlockedMaps,
+        );
+        this.simulation.state.players[member.id].character = member.character;
+      }
+      this.saves.clear();
       this.actionTimes.clear();
       void this.unlock();
       synchronize(this.state, this.simulation.state);
       void this.publishLobby();
-    } catch {
+    } catch (error) {
       for (const player of players) player.vote = false;
       for (const client of this.clients)
         client.send(
           "notice",
-          "재도전 권한을 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+          error instanceof Error
+            ? error.message
+            : "재도전 권한을 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.",
         );
     } finally {
       this.restarting = false;
@@ -465,7 +531,11 @@ export class ShootingRoom extends Room<{
       [...this.identities.values()].find(
         (value) => value.userId !== identity.userId,
       )?.nickname ?? "";
-    writer.queue({
+    const runId = this.runId;
+    const saving = writer.queue({
+      mapId: this.simulation.state.mapId,
+      ruleVersion: RULE_VERSION,
+      completed: this.simulation.state.completed && player.clearedStage === 10,
       runId: this.runId,
       userId: identity.userId,
       sessionId: identity.sessionId,
@@ -475,6 +545,23 @@ export class ShootingRoom extends Room<{
       teammate,
       finished,
     });
+    this.saves.set(player.id, saving);
+    if (finished)
+      void saving.then((saved) => {
+        if (this.runId === runId) {
+          if (
+            saved &&
+            this.simulation.state.completed &&
+            player.clearedStage === 10
+          ) {
+            const next = STAGE_MAPS[this.simulation.state.mapId].order + 1;
+            if (next < 3) player.unlockedMaps |= 1 << next;
+          }
+          this.clients
+            .find((client) => client.sessionId === player.id)
+            ?.send("record-saved", { saved });
+        }
+      });
   }
   private async validateParticipants(): Promise<void> {
     if (this.validating || !this.simulation) return;

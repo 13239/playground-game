@@ -1,9 +1,15 @@
 import { createHash, webcrypto } from "node:crypto";
-import { connectionMessage, type Mode } from "@playground/shooting-shared";
+import {
+  connectionMessage,
+  isStageMap,
+  type Mode,
+  type StageMapId,
+} from "@playground/shooting-shared";
 import { backend, type Identity } from "./backend.ts";
 import { config } from "./config.ts";
 
 export interface ConnectOptions {
+  mapId?: StageMapId;
   title?: string;
   privateRoom?: boolean;
   password?: string;
@@ -93,13 +99,17 @@ export async function authenticate(
     identity.browserKey !== thumbprint ||
     identity.origin !== config.origin ||
     identity.mode !== mode ||
+    !isStageMap(identity.mapId) ||
+    !Number.isInteger(identity.unlockedMaps) ||
+    identity.unlockedMaps < 1 ||
+    identity.unlockedMaps > 7 ||
     typeof identity.nickname !== "string" ||
     typeof identity.proofRequired !== "boolean" ||
     (!identity.proofRequired &&
       (!config.allowDevHttp || thumbprint !== "dev-http")) ||
-    (identity.proofRequired && thumbprint === "dev-http")
+    (identity.proofRequired && thumbprint === "dev-http") ||
     // 클라이언트 options의 플래그를 믿지 않고 인증 서버가 티켓에 기록한 정확한 방만 허용한다.
-    || (identity.invitedRoomCode != null &&
+    (identity.invitedRoomCode != null &&
       (creating || mode !== "COOP" || identity.invitedRoomCode !== roomId))
   )
     throw new Error("Invalid connection.");

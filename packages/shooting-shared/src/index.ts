@@ -1,5 +1,7 @@
 /** 렌더러·네트워크·서버가 같은 규칙을 사용하며 서버 전용 인증 정보는 이 패키지에 넣지 않는다. */
-export const RULE_VERSION = 2;
+export const RULE_VERSION = 3;
+export * from "./stages.ts";
+import type { StageMapId, ShootingCharacterId, StageDevice } from "./stages.ts";
 export const WORLD = {
   width: 1600,
   height: 960,
@@ -163,7 +165,14 @@ export const BALANCE = {
   reconnectSeconds: 15,
   pickupRadius: 38,
   inputTimeout: 0.35,
-  drops: { heal: 0.065, invul: 0.012, revive: 0.004 },
+  // 별 도전은 확률 대신 동일한 처치 수와 시작 보급으로 재현성을 유지한다.
+  supplies: {
+    healEvery: 6,
+    invulEvery: 18,
+    reviveEvery: 30,
+    startInvuls: 1,
+    startRevives: 1,
+  },
 } as const;
 export type Phase = "lobby" | "combat" | "upgrade" | "loot" | "over";
 export type EnemyKind =
@@ -179,9 +188,20 @@ export type EnemyKind =
   | "boss-artillery";
 export type PickupKind = "xp" | "heal" | "revive" | "invul";
 /** 공격 식별자와 범위를 공유해 서버 판정과 클라이언트 예고의 방향·크기를 일치시킨다. */
-export type EnemyAttack = "" | "shot" | "charge" | "artillery" | "melee"
-  | "boss-charge" | "boss-cleave" | "boss-fan" | "boss-ring"
-  | "boss-burst" | "boss-spiral" | "boss-mortar" | "boss-crossfire";
+export type EnemyAttack =
+  | ""
+  | "shot"
+  | "charge"
+  | "artillery"
+  | "melee"
+  | "boss-charge"
+  | "boss-cleave"
+  | "boss-fan"
+  | "boss-ring"
+  | "boss-burst"
+  | "boss-spiral"
+  | "boss-mortar"
+  | "boss-crossfire";
 export const BOSS_COMBAT = {
   fanArc: 1.4,
   cleaveRadius: 185,
@@ -199,6 +219,9 @@ export interface PlayerView {
   id: string;
   nickname: string;
   avatar: string;
+  /** 게임 외형 선택과 계정 프로필은 독립적이며 해금 마스크는 인증 서버에서만 받는다. */
+  character: ShootingCharacterId;
+  unlockedMaps: number;
   color: number;
   x: number;
   y: number;
@@ -242,6 +265,8 @@ export interface EnemyView {
   targetY: number;
   spawnRemaining: number;
   boss: boolean;
+  /** 노출된 약점의 남은 시간. 피해 배율은 서버 전투 계층만 판정한다. */
+  exposed: number;
 }
 export interface BulletView {
   id: string;
@@ -281,6 +306,12 @@ export interface EffectView {
   duration: number;
 }
 export interface GameSnapshot {
+  mapId: StageMapId;
+  nextMapId: StageMapId;
+  completed: boolean;
+  stars: number;
+  stageTimes: number[];
+  devices: Record<string, StageDevice>;
   /** 공개 방 정보만 동기화하며 비밀번호와 인증 신원은 포함하지 않는다. */
   hostId: string;
   title: string;
@@ -321,8 +352,9 @@ export interface InputFrame {
   firing: boolean;
 }
 export type GameAction =
-  | { type: "replay" }
-  | { type: "ready"; weapon: WeaponId }
+  | { type: "replay"; mapId?: StageMapId }
+  | { type: "map"; mapId: StageMapId }
+  | { type: "ready"; weapon: WeaponId; character: ShootingCharacterId }
   | { type: "dash" }
   | { type: "invul" }
   | { type: "revive"; target: "self" | "ally" }

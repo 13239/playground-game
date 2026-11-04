@@ -1,5 +1,12 @@
 import {
   BALANCE,
+  STAGE_MAPS,
+  STAGES_PER_MAP,
+  stageLayout,
+  mapStars,
+  mapUnlocked,
+  isStageMap,
+  isShootingCharacter,
   WORLD,
   EMPTY_UPGRADES,
   WEAPON_UPGRADES,
@@ -14,13 +21,12 @@ import {
   type GameAction,
   type Mode,
   type EnemyView,
-  type EnemyKind,
   type Phase,
-  type Rect,
   type PickupKind,
+  type StageMapId,
 } from "@playground/shooting-shared";
 import { CombatWorld } from "./combat.ts";
-import { Navigation, distanceSquared } from "./geometry.ts";
+import { distanceSquared } from "./geometry.ts";
 
 interface Control {
   frame: InputFrame;
@@ -47,13 +53,18 @@ export class GameSimulation {
   private resumePhase: Phase = "combat";
   private resumeDeadline = 0;
   private bossDefeated = false;
-  private lastBoss = -1;
   private ordinaryTotal = 0;
   private waveSize = 0;
 
-  constructor(mode: Mode, hooks: SimulationHooks) {
+  constructor(mode: Mode, hooks: SimulationHooks, mapId: StageMapId = "CAVE") {
     this.hooks = hooks;
     this.state = {
+      mapId,
+      nextMapId: mapId,
+      completed: false,
+      stars: 0,
+      stageTimes: [],
+      devices: {},
       hostId: "",
       title: "",
       privateRoom: false,
@@ -96,7 +107,12 @@ export class GameSimulation {
     });
   }
 
-  addPlayer(id: string, nickname: string, avatar: string): void {
+  addPlayer(
+    id: string,
+    nickname: string,
+    avatar: string,
+    unlockedMaps = 1,
+  ): void {
     if (
       this.state.phase !== "lobby" ||
       this.activePlayers().length >= (this.state.mode === "SINGLE" ? 1 : 2)
@@ -106,6 +122,8 @@ export class GameSimulation {
       id,
       nickname,
       avatar,
+      character: isShootingCharacter(avatar) ? avatar : "MINT_ROBOT",
+      unlockedMaps,
       // 방장 승계 후 새 참가자가 들어와도 남은 팀원과 같은 색을 배정하지 않는다.
       color: this.activePlayers().some((p) => p.color === 0x55cfff)
         ? 0x7de7aa
@@ -127,8 +145,9 @@ export class GameSimulation {
       inputSequence: -1,
       weapon: "rifle",
       upgrades: EMPTY_UPGRADES(),
-      revives: 0,
-      invuls: 0,
+      // 짧은 맵 도전에서 아이템 운 때문에 첫 구조 기회를 잃지 않게 동일한 시작 보급을 준다.
+      revives: BALANCE.supplies.startRevives,
+      invuls: BALANCE.supplies.startInvuls,
       dashCooldown: 0,
       invulCooldown: 0,
       protection: 0,
@@ -214,17 +233,44 @@ export class GameSimulation {
       return;
     }
     if (this.state.paused) return;
+    // 방장만 맵을 바꾸며 두 참가자 모두 해금한 맵만 출격할 수 있다.
+    if (
+      value.type === "map" &&
+      this.state.phase === "lobby" &&
+      id === this.state.hostId &&
+      isStageMap(value.mapId)
+    ) {
+      if (
+        !this.activePlayers().every((p) =>
+          mapUnlocked(p.unlockedMaps, value.mapId),
+        )
+      ) {
+        this.state.notice = "두 사람 모두 해금한 맵만 선택할 수 있어요.";
+        return;
+      }
+      this.state.mapId = value.mapId;
+      this.state.notice = "";
+      for (const p of this.activePlayers()) p.ready = false;
+      return;
+    }
     if (
       value.type === "ready" &&
       this.state.phase === "lobby" &&
-      isWeapon(value.weapon)
+      isWeapon(value.weapon) &&
+      isShootingCharacter(value.character)
     ) {
       player.weapon = value.weapon;
+      player.character = value.character;
       player.ready = true;
       const players = this.activePlayers();
       if (
         players.length === (this.state.mode === "SINGLE" ? 1 : 2) &&
-        players.every((p) => p.ready && p.connected)
+        players.every(
+          (p) =>
+            p.ready &&
+            p.connected &&
+            mapUnlocked(p.unlockedMaps, this.state.mapId),
+        )
       ) {
         for (const p of players) this.hooks.record(p, false);
         this.nextStage();
@@ -483,6 +529,8 @@ export class GameSimulation {
   }
 
   private nextStage(): void {
+    // 맵은 10스테이지에서 완결한다. 자동으로 다음 맵이나 무한 도전에 진입하지 않는다.
+    if (this.state.stage >= STAGES_PER_MAP) return;
     this.state.stage++;
     this.state.phase = "combat";
     this.state.deadline = 0;
@@ -493,12 +541,16 @@ export class GameSimulation {
     this.state.pickups = {};
     this.state.effects = {};
     this.bossDefeated = false;
-    this.state.walls = this.generateWalls();
+    const layout = stageLayout(this.state.mapId, this.state.stage);
+    this.state.walls = layout.walls;
+    this.state.devices = Object.fromEntries(
+      layout.devices.map((device) => [device.id, device]),
+    );
     this.combat.reset();
     let seat = 0;
     for (const player of this.activePlayers()) {
       player.x = WORLD.width / 2 + (seat++ === 0 ? -45 : 45);
-      player.y = WORLD.height / 2 + 90;
+      player.y = WORLD.height - 110;
       player.dashCooldown = 0;
       player.invulCooldown = 0;
       player.protection = 0;
@@ -509,36 +561,26 @@ export class GameSimulation {
       control.age = 10;
     }
     if (this.state.stage % 5 === 0) {
-      const choices = [0, 1, 2].filter((index) => index !== this.lastBoss);
-      this.lastBoss = choices[Math.floor(this.hooks.random() * choices.length)];
-      const kinds: EnemyKind[] = [
-        "boss-charge",
-        "boss-barrage",
-        "boss-artillery",
-      ];
-      this.state.bossName = [
-        "돌진형 · 브레이커",
-        "사격형 · 센티넬",
-        "포격형 · 디스트로이어",
-      ][this.lastBoss];
+      const map = STAGE_MAPS[this.state.mapId];
+      this.state.bossName = this.state.stage === 5 ? map.guardian : map.boss;
       this.ordinaryTotal = Math.ceil(
-        (6 + 2 * Math.floor(Math.log2(this.state.stage / 5 + 1))) *
-          (this.state.mode === "COOP" ? 1.8 : 1),
+        (this.state.stage === 5 ? 5 : 8) *
+          (this.state.mode === "COOP" ? 1.5 : 1),
       );
       this.state.enemyTotal = this.ordinaryTotal + 1;
       this.state.waveCount = 1;
       this.state.wave = 1;
-      this.combat.spawn(kinds[this.lastBoss]);
+      this.combat.spawn(map.bossKind);
       for (let index = 0; index < this.ordinaryTotal; index++)
-        this.combat.spawn();
+        this.combat.spawn(map.ordinary[index % map.ordinary.length]);
     } else {
       this.state.bossName = "";
       this.ordinaryTotal = Math.ceil(
-        (18 + 4 * this.state.stage) * (this.state.mode === "COOP" ? 1.8 : 1),
+        (14 + 2 * this.state.stage) * (this.state.mode === "COOP" ? 1.6 : 1),
       );
       this.waveSize = Math.ceil(
-        (10 + Math.log2(this.state.stage + 1) * 3) *
-          (this.state.mode === "COOP" ? 1.8 : 1),
+        (8 + Math.floor(this.state.stage / 3)) *
+          (this.state.mode === "COOP" ? 1.5 : 1),
       );
       this.state.enemyTotal = this.ordinaryTotal;
       this.state.waveCount = Math.ceil(this.ordinaryTotal / this.waveSize);
@@ -553,12 +595,21 @@ export class GameSimulation {
     );
     if (count <= 0) return;
     this.state.wave++;
-    for (let index = 0; index < count; index++) this.combat.spawn();
+    const kinds = STAGE_MAPS[this.state.mapId].ordinary;
+    for (let index = 0; index < count; index++)
+      this.combat.spawn(
+        kinds[(this.state.enemiesSpawned + this.state.stage) % kinds.length],
+      );
   }
   private clearStage(): void {
     if (this.state.phase !== "combat") return;
     this.state.clearedStage = this.state.stage;
     this.state.clearMillis = Math.round(this.state.combatMillis);
+    const priorTime = this.state.stageTimes.reduce(
+      (sum, time) => sum + time,
+      0,
+    );
+    this.state.stageTimes.push(this.state.clearMillis - priorTime);
     this.state.phase = "loot";
     // 클리어 뒤에는 수거 시간을 주지 않고 짧은 전환만 표시한다.
     this.state.deadline = BALANCE.lootSeconds;
@@ -568,9 +619,18 @@ export class GameSimulation {
     for (const player of this.activePlayers()) {
       player.clearedStage = this.state.clearedStage;
       player.clearMillis = this.state.clearMillis;
-      this.hooks.record(player, false);
+      if (this.state.stage < STAGES_PER_MAP) this.hooks.record(player, false);
     }
     this.effect("stage-clear", WORLD.width / 2, WORLD.height / 2, 200);
+    if (this.state.stage === STAGES_PER_MAP) {
+      this.state.completed = true;
+      this.state.stars = mapStars(
+        this.state.mapId,
+        this.state.mode,
+        this.state.clearMillis,
+      );
+      this.end();
+    }
   }
 
   private defeated(enemy: EnemyView): void {
@@ -578,17 +638,17 @@ export class GameSimulation {
     if (enemy.boss) this.bossDefeated = true;
     const amount = enemy.boss
       ? 120
-      : 8 / (this.state.mode === "COOP" ? 1.8 : 1);
+      : 12 / (this.state.mode === "COOP" ? 1.6 : 1);
     // 경험치는 자동 획득한다. 처치 순회 도중 강화 화면으로 전환하지 않도록 틱 끝에 적용한다.
     this.state.xp += amount;
-    for (const kind of ["heal", "invul", "revive"] as const)
-      if (this.hooks.random() < BALANCE.drops[kind])
-        this.drop(
-          kind,
-          enemy.x + (this.hooks.random() - 0.5) * 35,
-          enemy.y + (this.hooks.random() - 0.5) * 35,
-          1,
-        );
+    // 별 도전의 보급 기회는 같은 처치 수에서 재현된다. 확률 행운이 기록을 결정하지 않는다.
+    const count = this.state.enemiesKilled;
+    if (count % BALANCE.supplies.healEvery === 0)
+      this.drop("heal", enemy.x, enemy.y, 1);
+    if (count % BALANCE.supplies.invulEvery === 0)
+      this.drop("invul", enemy.x + 24, enemy.y, 1);
+    if (count % BALANCE.supplies.reviveEvery === 0)
+      this.drop("revive", enemy.x - 24, enemy.y, 1);
   }
   private drop(kind: PickupKind, x: number, y: number, amount: number): void {
     const id = this.nextId();
@@ -720,16 +780,29 @@ export class GameSimulation {
     // 시각 효과 수만 제한한다. 피해·공격속도·성장 판정에는 이 제한을 적용하지 않는다.
     // 집중 사격 중에도 처치 모션이 피격 스파크에 밀려 사라지지 않게 우선 표시한다.
     if (Object.keys(this.state.effects).length >= 160) {
-      const expendable = (kind === "death" || kind === "boss-death")
-        ? Object.values(this.state.effects).find(effect => effect.kind === "hit")
-        : undefined;
+      const expendable =
+        kind === "death" || kind === "boss-death"
+          ? Object.values(this.state.effects).find(
+              (effect) => effect.kind === "hit",
+            )
+          : undefined;
       if (!expendable) return;
       delete this.state.effects[expendable.id];
     }
     const id = this.nextId();
     // 효과별 진행률을 클라이언트에서 동일하게 계산하며 공격 판정과 시각적 수명을 분리한다.
-    const duration = kind === "hit" ? 0.2 : kind === "death" ? 0.85 : kind === "boss-death" ? 1.1
-      : kind === "revive" ? 0.8 : kind === "stage-clear" ? 0.75 : 0.55;
+    const duration =
+      kind === "hit"
+        ? 0.2
+        : kind === "death"
+          ? 0.85
+          : kind === "boss-death"
+            ? 1.1
+            : kind === "revive"
+              ? 0.8
+              : kind === "stage-clear"
+                ? 0.75
+                : 0.55;
     this.state.effects[id] = {
       id,
       kind,
@@ -743,21 +816,5 @@ export class GameSimulation {
   }
   private nextId(): string {
     return (++this.serial).toString(36);
-  }
-  private generateWalls(): Rect[] {
-    for (let attempt = 0; attempt < 20; attempt++) {
-      const walls: Rect[] = [];
-      for (const x of [240, 480, 1040, 1280])
-        for (const y of [240, 600])
-          if (this.hooks.random() < 0.7)
-            walls.push({
-              x: x + Math.floor(this.hooks.random() * 2) * 40,
-              y,
-              width: 80 + Math.floor(this.hooks.random() * 2) * 40,
-              height: 80 + Math.floor(this.hooks.random() * 2) * 40,
-            });
-      if (new Navigation(walls).connected()) return walls;
-    }
-    return [];
   }
 }

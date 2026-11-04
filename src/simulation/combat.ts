@@ -1,5 +1,7 @@
 import {
   WORLD,
+  STAGE_MAPS,
+  stageSpawn,
   BOSS_COMBAT,
   movement,
   weaponStats,
@@ -11,6 +13,7 @@ import {
   type BulletView,
   type HazardView,
   type Rect,
+  type StageDevice,
 } from "@playground/shooting-shared";
 import {
   Navigation,
@@ -85,11 +88,18 @@ const traits = {
   { health: number; speed: number; radius: number; ranged: boolean }
 >;
 
-/** 보스마다 네 패턴을 순환해 같은 공격만 반복하지 않고, 연속 공격도 서버 틱 안에서 끝낸다. */
+/** 보스마다 맵 고유 패턴을 순환해 같은 공격만 반복하지 않고, 연속 공격도 서버 틱 안에서 끝낸다. */
 const bossPatterns = {
-  "boss-charge": ["boss-charge", "boss-fan", "boss-cleave", "boss-ring"],
-  "boss-barrage": ["boss-fan", "boss-burst", "boss-spiral", "boss-ring"],
-  "boss-artillery": ["boss-mortar", "boss-crossfire", "boss-burst", "boss-ring"],
+  "boss-charge": ["boss-charge", "boss-cleave", "boss-fan"],
+  "boss-barrage": ["boss-spiral", "boss-burst", "boss-crossfire"],
+  "boss-artillery": ["boss-mortar", "boss-ring", "boss-fan"],
+} as const satisfies Partial<Record<EnemyKind, readonly EnemyAttack[]>>;
+
+// 중간 수호자는 두 가지 공략을 먼저 익히게 하고, 최종 보스는 추가 패턴과 다른 순서로 확장한다.
+const guardianPatterns = {
+  "boss-charge": ["boss-charge", "boss-cleave"],
+  "boss-barrage": ["boss-burst", "boss-crossfire"],
+  "boss-artillery": ["boss-mortar", "boss-fan"],
 } as const satisfies Partial<Record<EnemyKind, readonly EnemyAttack[]>>;
 
 /** 전투 판정은 서버에서 고정 간격으로 수행한다. 네트워크 스키마와 Phaser 객체에 의존하지 않는다. */
@@ -142,48 +152,23 @@ export class CombatWorld {
   spawn(kind?: EnemyKind): void {
     const state = this.hooks.state,
       stage = state.stage;
-    const selected =
-      kind ??
-      ordinary[
-        Math.floor(this.hooks.random() * (stage < 2 ? 3 : ordinary.length))
-      ];
+    const roster = STAGE_MAPS[state.mapId].ordinary;
+    const selected = kind ?? roster[state.enemiesSpawned % roster.length];
     const trait = traits[selected];
     const boss = selected.startsWith("boss");
-    let point = { x: WORLD.width / 2, y: 230 };
-    if (!boss) {
-      for (let attempt = 0; attempt < 80; attempt++) {
-        const side = Math.floor(this.hooks.random() * 4);
-        point =
-          side < 2
-            ? {
-                x: side === 0 ? 105 : WORLD.width - 105,
-                y: 110 + this.hooks.random() * (WORLD.height - 220),
-              }
-            : {
-                x: 110 + this.hooks.random() * (WORLD.width - 220),
-                y: side === 2 ? 105 : WORLD.height - 105,
-              };
-        if (
-          !state.walls.some(
-            (w) =>
-              point.x > w.x - 40 &&
-              point.x < w.x + w.width + 40 &&
-              point.y > w.y - 40 &&
-              point.y < w.y + w.height + 40,
-          ) &&
-          Object.values(state.players).every(
-            (p) => !p.alive || distanceSquared(p, point) > 150 ** 2,
-          )
-        )
-          break;
-      }
-    }
+    // 같은 맵의 출현 위치와 등장 순서는 반복 도전에서도 재현한다.
+    const point = boss
+      ? { x: WORLD.width / 2, y: 330 }
+      : stageSpawn(state.mapId, stage, state.enemiesSpawned);
     const baseHealth = boss
-      ? 900 * (1 + stage * 0.15) ** 1.8
-      : 34 * (1 + (stage - 1) * 0.18) ** 1.35;
+      ? stage === 5
+        ? 1400
+        : 2400
+      : 34 * (1 + (stage - 1) * 0.075);
     const hp =
       baseHealth *
-      (state.mode === "COOP" ? (boss ? 2.5 : 1.4) : 1) *
+      (state.mode === "COOP" ? (boss ? 1.9 : 1.1) : 1) *
+      (1 + STAGE_MAPS[state.mapId].order * 0.12) *
       trait.health;
     const id = this.hooks.nextId();
     const enemy: EnemyActor = {
@@ -199,9 +184,10 @@ export class CombatWorld {
       targetY: point.y,
       spawnRemaining: boss ? 1 : 0.65,
       boss,
-      cooldown: 0.8 + this.hooks.random(),
+      exposed: 0,
+      cooldown: 0.8 + (state.enemiesSpawned % 4) * 0.2,
       speed: (105 + 26 * Math.log2(stage + 1)) * trait.speed,
-      damage: 12 * (1 + stage * 0.09) ** 2.15 * (boss ? 1.3 : 1),
+      damage: 10 * (1 + stage * 0.055) ** 1.25 * (boss ? 1.3 : 1),
       charging: 0,
       chargeX: 0,
       chargeY: 0,
@@ -306,6 +292,7 @@ export class CombatWorld {
     dt: number,
   ): void {
     if (enemy.hp <= 0) return;
+    enemy.exposed = Math.max(0, enemy.exposed - dt);
     enemy.spawnRemaining = Math.max(0, enemy.spawnRemaining - dt);
     if (enemy.spawnRemaining > 0 || players.length === 0) return;
     const target = players.reduce((best, p) =>
@@ -315,6 +302,7 @@ export class CombatWorld {
     enemy.angle = Math.atan2(target.y - enemy.y, target.x - enemy.x);
     enemy.cooldown -= dt;
     if (enemy.charging > 0) {
+      const before = { x: enemy.x, y: enemy.y };
       const next = movement(
         enemy.x,
         enemy.y,
@@ -326,8 +314,37 @@ export class CombatWorld {
       enemy.x = next.x;
       enemy.y = next.y;
       enemy.charging -= dt;
-      // 돌진 뒤 보스는 부채꼴 후속 사격을 별도로 예고해 바로 앞의 플레이어도 회피할 수 있다.
-      if (enemy.charging <= 0 && enemy.boss) {
+      // 수정 동굴의 돌기둥에 돌진을 유도하면 장갑이 깨져 공격 기회가 생긴다.
+      if (
+        enemy.boss &&
+        this.hooks.state.mapId === "CAVE" &&
+        Math.hypot(enemy.x - before.x, enemy.y - before.y) <
+          Math.hypot(enemy.chargeX, enemy.chargeY) * dt * 0.4
+      ) {
+        const pillar = Object.values(this.hooks.state.devices).find(
+          (d) =>
+            d.kind === "pillar" &&
+            d.hp > 0 &&
+            distanceSquared(d, enemy) < (d.radius + enemy.radius + 16) ** 2,
+        );
+        if (pillar) {
+          this.damageDevice(pillar, pillar.hp);
+          enemy.exposed = 6;
+          enemy.charging = 0;
+          enemy.warning = 0;
+          enemy.cooldown = 1.4;
+          this.hooks.effect(
+            "armor-break",
+            enemy.x,
+            enemy.y,
+            enemy.radius * 1.7,
+          );
+          return;
+        }
+      }
+      // 돌진 뒤 최종 보스는 부채꼴 후속 사격을 별도로 예고해 바로 앞의 플레이어도 회피할 수 있다.
+      // 중간 수호자는 돌진 뒤 빈틈을 유지해 기둥 유인과 근접 회피를 먼저 익히게 한다.
+      if (enemy.charging <= 0 && enemy.boss && this.hooks.state.stage === 10) {
         enemy.attack = "boss-fan";
         enemy.targetX = target.x;
         enemy.targetY = target.y;
@@ -396,7 +413,15 @@ export class CombatWorld {
           enemy.y = next.y;
         }
       }
-      const meleeSwing = enemy.kind === "brute" && dist < 120 && visible;
+      const gardenSpore =
+        this.hooks.state.mapId === "GARDEN" &&
+        enemy.kind === "chaser" &&
+        dist < 300;
+      const meleeSwing =
+        (enemy.kind === "brute" ||
+          (this.hooks.state.mapId === "FACTORY" && enemy.kind === "chaser")) &&
+        dist < 120 &&
+        visible;
       if (
         enemy.cooldown <= 0 &&
         (enemy.boss
@@ -405,19 +430,21 @@ export class CombatWorld {
             ? visible && dist < 700
             : enemy.kind.includes("charge")
               ? visible && dist < 620
-              : meleeSwing)
+              : meleeSwing || gardenSpore)
       ) {
         enemy.targetX = target.x;
         enemy.targetY = target.y;
         if (enemy.boss) {
-          const patterns = bossPatterns[enemy.kind as keyof typeof bossPatterns];
+          const patterns = (
+            this.hooks.state.stage === 5 ? guardianPatterns : bossPatterns
+          )[enemy.kind as keyof typeof bossPatterns];
           enemy.attack = patterns[enemy.attackCycle++ % patterns.length];
           enemy.warning = enemy.attack === "boss-charge" ? 0.95 : 0.8;
         } else {
           enemy.warning = enemy.kind.includes("charge") ? 0.6 : 0.4;
           enemy.attack = enemy.kind.includes("charge")
             ? "charge"
-            : enemy.kind.includes("artillery")
+            : enemy.kind.includes("artillery") || gardenSpore
               ? "artillery"
               : meleeSwing
                 ? "melee"
@@ -481,7 +508,11 @@ export class CombatWorld {
     } else if (enemy.attack === "boss-ring") {
       const count = enraged ? 16 : 12;
       for (let i = 0; i < count; i++)
-        this.hostileBullet(enemy, angle + (i + 0.5) * Math.PI * 2 / count, 235);
+        this.hostileBullet(
+          enemy,
+          angle + ((i + 0.5) * Math.PI * 2) / count,
+          235,
+        );
     } else if (enemy.attack === "boss-cleave") {
       const { cleaveRadius: radius, cleaveHalfAngle } = BOSS_COMBAT;
       this.hooks.effect("melee-swipe", enemy.x, enemy.y, radius, angle);
@@ -498,17 +529,28 @@ export class CombatWorld {
       // 최대 18회만 예약하며 별도 타이머·클로저를 만들지 않는다. 일시정지 시 시뮬레이션과 함께 멈춘다.
       enemy.attackStep = 0;
       enemy.volleyWait = 0;
-      enemy.volleyRemaining = enemy.attack === "boss-spiral"
-        ? (enraged ? 18 : 12)
-        : enemy.attack === "boss-burst"
-          ? (enraged ? 4 : 3)
-          : (enraged ? 7 : 5);
+      enemy.volleyRemaining =
+        enemy.attack === "boss-spiral"
+          ? enraged
+            ? 18
+            : 12
+          : enemy.attack === "boss-burst"
+            ? enraged
+              ? 4
+              : 3
+            : enraged
+              ? 7
+              : 5;
       this.advanceBossVolley(enemy, 0);
     }
   }
 
   private fan(
-    enemy: EnemyActor, angle: number, count: number, arc: number, speed: number,
+    enemy: EnemyActor,
+    angle: number,
+    count: number,
+    arc: number,
+    speed: number,
   ): void {
     for (let i = 0; i < count; i++)
       this.hostileBullet(enemy, angle + (i / (count - 1) - 0.5) * arc, speed);
@@ -522,7 +564,10 @@ export class CombatWorld {
       enemy.volleyRemaining > 0 && enemy.volleyWait <= 0 && emitted < 4;
       emitted++
     ) {
-      const angle = Math.atan2(enemy.targetY - enemy.y, enemy.targetX - enemy.x);
+      const angle = Math.atan2(
+        enemy.targetY - enemy.y,
+        enemy.targetX - enemy.x,
+      );
       const step = enemy.attackStep++;
       if (enemy.attack === "boss-burst") {
         this.fan(enemy, angle + (step % 2 ? 0.07 : -0.07), 3, 0.32, 360);
@@ -533,11 +578,16 @@ export class CombatWorld {
         enemy.volleyWait += 0.11;
       } else {
         // 중심→주변 또는 십자 순서로 낙하한다. 각 지점은 생성 후 0.9초를 온전히 예고한다.
-        const offset = step === 0 ? 0
-          : enemy.attack === "boss-crossfire" ? 180 * Math.ceil(step / 4) : 185;
-        const direction = enemy.attack === "boss-crossfire"
-          ? angle + (step - 1) * Math.PI / 2
-          : angle + (step - 1) * Math.PI / 3;
+        const offset =
+          step === 0
+            ? 0
+            : enemy.attack === "boss-crossfire"
+              ? 180 * Math.ceil(step / 4)
+              : 185;
+        const direction =
+          enemy.attack === "boss-crossfire"
+            ? angle + ((step - 1) * Math.PI) / 2
+            : angle + ((step - 1) * Math.PI) / 3;
         this.artillery(
           enemy,
           enemy.targetX + Math.cos(direction) * offset,
@@ -574,12 +624,18 @@ export class CombatWorld {
     const hazard: HazardActor = {
       id,
       // 경계에서도 원 전체와 예고가 보이도록 실제 판정 위치를 함께 제한한다.
-      x: Math.max(WORLD.border + radius, Math.min(WORLD.width - WORLD.border - radius, x)),
-      y: Math.max(WORLD.border + radius, Math.min(WORLD.height - WORLD.border - radius, y)),
+      x: Math.max(
+        WORLD.border + radius,
+        Math.min(WORLD.width - WORLD.border - radius, x),
+      ),
+      y: Math.max(
+        WORLD.border + radius,
+        Math.min(WORLD.height - WORLD.border - radius, y),
+      ),
       radius,
       warning: 0.9,
       life: 0.3,
-      kind: "artillery",
+      kind: this.hooks.state.mapId === "GARDEN" ? "spore" : "artillery",
       damage: enemy.damage * 1.25,
       activated: false,
     };
@@ -618,7 +674,7 @@ export class CombatWorld {
         dx = (bullet.vx / speed) * remaining,
         dy = (bullet.vy / speed) * remaining;
       let fraction = 1.001,
-        target: EnemyActor | PlayerView | undefined,
+        target: EnemyActor | PlayerView | StageDevice | undefined,
         wall = false;
       for (const item of this.collisionWalls) {
         const hit = segmentRect(
@@ -665,6 +721,24 @@ export class CombatWorld {
           wall = false;
         }
       }
+      if (!bullet.hostile) {
+        for (const device of Object.values(this.hooks.state.devices)) {
+          if (device.hp <= 0 || bullet.hit.has(device.id)) continue;
+          const at = segmentCircle(
+            bullet.x,
+            bullet.y,
+            dx,
+            dy,
+            device,
+            device.radius + bullet.radius,
+          );
+          if (at !== undefined && at < fraction) {
+            fraction = at;
+            target = device;
+            wall = false;
+          }
+        }
+      }
       const travel = Math.min(1, fraction);
       bullet.x += dx * travel;
       bullet.y += dy * travel;
@@ -680,6 +754,11 @@ export class CombatWorld {
         if (bullet.hostile) {
           this.hooks.hitPlayer(target as PlayerView, bullet.damage);
           this.removeBullet(bullet, false);
+          return;
+        }
+        if (!("boss" in target)) {
+          this.damageDevice(target as StageDevice, bullet.damage);
+          this.removeBullet(bullet, true);
           return;
         }
         const enemy = target as EnemyActor;
@@ -725,16 +804,83 @@ export class CombatWorld {
       )
         this.damageEnemy(enemy, bullet.explosionDamage);
     }
+    for (const device of Object.values(this.hooks.state.devices))
+      if (
+        device.hp > 0 &&
+        distanceSquared(device, bullet) <= (bullet.blast + device.radius) ** 2
+      )
+        this.damageDevice(device, bullet.explosionDamage);
+  }
+  /** 장치 파괴·연쇄 폭발은 서버의 동일한 피해 경로를 사용하며 재귀 중 같은 장치를 다시 파괴하지 않는다. */
+  private damageDevice(device: StageDevice, damage: number): void {
+    if (device.hp <= 0) return;
+    device.hp = Math.max(0, device.hp - damage);
+    this.hooks.effect(
+      "hit",
+      device.x,
+      device.y - device.radius,
+      0,
+      Math.round(damage),
+    );
+    if (device.hp > 0) return;
+    this.hooks.effect(
+      "device-break",
+      device.x,
+      device.y,
+      device.kind === "crystal" ? 220 : 90,
+    );
+    if (device.kind === "pillar") {
+      this.hooks.state.walls = this.hooks.state.walls.filter(
+        (w) =>
+          !(
+            Math.abs(w.x + w.width / 2 - device.x) < 1 &&
+            Math.abs(w.y + w.height / 2 - device.y) < 1
+          ),
+      );
+      this.navigation = new Navigation(this.hooks.state.walls);
+      this.collisionWalls = [...this.hooks.state.walls, ...this.boundaries()];
+    }
+    if (device.kind === "crystal") {
+      for (const enemy of [...this.enemies.values()]) {
+        if (distanceSquared(enemy, device) > (220 + enemy.radius) ** 2)
+          continue;
+        enemy.exposed = Math.max(enemy.exposed, 3);
+        this.damageEnemy(enemy, enemy.boss ? enemy.maxHp * 0.1 : enemy.maxHp);
+      }
+    }
+    if (device.kind === "generator" || device.kind === "root") {
+      for (const enemy of this.enemies.values()) {
+        if (!enemy.boss) continue;
+        enemy.exposed = 8;
+        enemy.volleyRemaining = 0;
+        enemy.warning = 0;
+        enemy.cooldown = 1.5;
+      }
+      // 뿌리를 자르면 이미 생성된 꽃가루도 걷혀 접근 경로가 실제로 열린다.
+      if (device.kind === "root") {
+        this.hazards.clear();
+        this.hooks.state.hazards = {};
+      }
+    }
   }
   private damageEnemy(enemy: EnemyActor, damage: number): void {
     if (!this.enemies.has(enemy.id) || enemy.hp <= 0) return;
-    enemy.hp = Math.max(0, enemy.hp - damage);
+    const state = this.hooks.state;
+    const powered = Object.values(state.devices).some(
+      (d) =>
+        d.hp > 0 &&
+        (d.kind === "generator" || (enemy.boss && d.kind === "root")),
+    );
+    // 공격 우선순위·장갑 파괴에 성공하면 같은 무기로도 처치 시간이 분명히 줄어든다.
+    const multiplier = enemy.exposed > 0 ? 2.2 : powered ? 0.45 : 1;
+    const actual = damage * multiplier;
+    enemy.hp = Math.max(0, enemy.hp - actual);
     this.hooks.effect(
       "hit",
       enemy.x,
       enemy.y - enemy.radius,
       0,
-      Math.round(damage),
+      Math.round(actual),
     );
     if (enemy.hp <= 0) this.kill(enemy);
   }
