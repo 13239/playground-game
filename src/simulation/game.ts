@@ -28,6 +28,7 @@ import {
   type StageMapId,
 } from "@playground/shooting-shared";
 import { CombatWorld } from "./combat.ts";
+import { MissionDirector } from "./missions.ts";
 import { distanceSquared } from "./geometry.ts";
 
 interface Control {
@@ -45,6 +46,7 @@ export interface SimulationHooks {
 export class GameSimulation {
   readonly state: GameSnapshot;
   private readonly combat: CombatWorld;
+  private readonly mission: MissionDirector;
   private readonly controls = new Map<string, Control>();
   private readonly drops = new Map<string, number>();
   private readonly hooks: SimulationHooks;
@@ -61,6 +63,13 @@ export class GameSimulation {
   constructor(mode: Mode, hooks: SimulationHooks, mapId: StageMapId = "CAVE") {
     this.hooks = hooks;
     this.state = {
+      missionNodes: {},
+      objectiveText: "",
+      objectiveHint: "",
+      objectiveStep: 0,
+      objectiveTotal: 0,
+      objectiveWindow: 0,
+      objectiveComplete: false,
       mapId,
       nextMapId: mapId,
       completed: false,
@@ -107,6 +116,18 @@ export class GameSimulation {
       defeated: (enemy) => this.defeated(enemy),
       effect: (kind, x, y, radius, value) =>
         this.effect(kind, x, y, radius, value),
+      missionHit: (id, vx, vy, owner) => this.mission.hit(id, vx, vy, owner),
+      bossPhase: () => this.mission.step(0),
+    });
+    this.mission = new MissionDirector({
+      state: this.state,
+      hazard: (hazard, impact) => this.combat.queueMissionHazard(hazard, impact),
+      reward: () => this.combat.openMissionWindow(),
+      effect: (kind, x, y, radius, value) => this.effect(kind, x, y, radius, value),
+      firing: (id) => {
+        const control = this.controls.get(id);
+        return Boolean(control && control.age < BALANCE.inputTimeout && control.frame.firing);
+      },
     });
   }
 
@@ -445,20 +466,14 @@ export class GameSimulation {
           dt,
         );
       }
+      // 시간 초과는 공략 내부의 복구·재시도로 처리한다. 정지·강화 중에는 시간이 흐르지 않는다.
+      this.mission.step(dt);
       this.combat.step(dt);
-      const plan = encounterFor(this.state.stage);
-      const devicesAlive = Object.values(this.state.devices).some((device) => device.kind !== "pillar" && device.hp > 0);
-      // 시간 초과는 임의 피해가 아니라 명확한 목표 실패로 종료한다. 정지·강화 중에는 시간이 흐르지 않는다.
-      if (plan.goal === "disrupt" && devicesAlive && this.state.stageMillis >= plan.limit * 1000) {
-        this.state.notice = "장치 가동을 막지 못했어요. 장치부터 제압하고 다시 도전하세요.";
-        this.end();
-        return;
-      }
       if (
         (this.bossDefeated ||
         (this.state.enemiesSpawned >= this.state.enemyTotal &&
           this.combat.size === 0)) &&
-        (!(plan.goal === "devices" || plan.goal === "disrupt") || !devicesAlive)
+        this.state.objectiveComplete
       )
         this.clearStage();
       else if (
@@ -591,19 +606,20 @@ export class GameSimulation {
       this.state.waveCount = 1;
       this.state.wave = 1;
       this.combat.spawn(map.bossKind);
-      const roles = encounterFor(this.state.stage).roles;
+      const roles = encounterFor(this.state.mapId, this.state.stage).roles;
       for (let index = 0; index < this.ordinaryTotal; index++)
         this.combat.spawn(roles[index % roles.length]);
     } else {
       this.state.bossName = "";
       // 수보다 조합을 우선한다. 작은 분대로 압박과 반격의 리듬을 만들고 9스테이지에서 종합한다.
-      const plan = encounterFor(this.state.stage);
+      const plan = encounterFor(this.state.mapId, this.state.stage);
       this.ordinaryTotal = Math.ceil(plan.enemies * (this.state.mode === "COOP" ? 1.5 : 1));
       this.waveSize = Math.ceil(plan.pack * (this.state.mode === "COOP" ? 1.4 : 1));
       this.state.enemyTotal = this.ordinaryTotal;
       this.state.waveCount = Math.ceil(this.ordinaryTotal / this.waveSize);
       this.spawnWave();
     }
+    this.mission.reset();
   }
 
   private spawnWave(): void {
@@ -613,7 +629,7 @@ export class GameSimulation {
     );
     if (count <= 0) return;
     this.state.wave++;
-    const kinds = [...new Set<EnemyView["kind"]>([...encounterFor(this.state.stage).roles, ...STAGE_MAPS[this.state.mapId].ordinary])];
+    const kinds = [...new Set<EnemyView["kind"]>([...encounterFor(this.state.mapId, this.state.stage).roles, ...STAGE_MAPS[this.state.mapId].ordinary])];
     for (let index = 0; index < count; index++)
       this.combat.spawn(
         kinds[this.state.enemiesSpawned % kinds.length],

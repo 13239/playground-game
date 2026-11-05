@@ -1,8 +1,10 @@
 /** 렌더러·네트워크·서버가 같은 규칙을 사용하며 서버 전용 인증 정보는 이 패키지에 넣지 않는다. */
-// 버전 5는 짧은 대시·패턴 공략 전투다. 과거 별·해금은 보존하고 랭킹은 현재 버전만 비교한다.
-export const RULE_VERSION = 5;
+// 버전 6은 맵별 60개 공략 임무다. 과거 별·해금은 보존하고 랭킹은 현재 버전만 비교한다.
+export const RULE_VERSION = 6;
 export * from "./stages.ts";
 export * from "./encounters.ts";
+export * from "./missions.ts";
+import type { MissionNodeView } from "./missions.ts";
 import type { StageMapId, ShootingCharacterId, StageDevice } from "./stages.ts";
 export const WORLD = {
   width: 1600,
@@ -309,6 +311,12 @@ export interface HazardView {
   warning: number;
   life: number;
   kind: string;
+  /** 원·고리·직선 공격의 실제 경계와 전체 예고 시간을 동기화한다. */
+  shape?: string;
+  angle?: number;
+  length?: number;
+  innerRadius?: number;
+  windup?: number;
 }
 export interface EffectView {
   id: string;
@@ -321,6 +329,14 @@ export interface EffectView {
   duration: number;
 }
 export interface GameSnapshot {
+  /** 공략 진행과 보스 방어는 서버 권한 상태다. 브라우저에서 성공 메시지를 제출하지 않는다. */
+  missionNodes: Record<string, MissionNodeView>;
+  objectiveText: string;
+  objectiveHint: string;
+  objectiveStep: number;
+  objectiveTotal: number;
+  objectiveWindow: number;
+  objectiveComplete: boolean;
   mapId: StageMapId;
   nextMapId: StageMapId;
   completed: boolean;

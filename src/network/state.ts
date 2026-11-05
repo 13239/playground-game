@@ -92,8 +92,8 @@ const Pickup = schema(
 );
 const Hazard = schema(
   {
-    ...strings("id", "kind"),
-    ...numbers("x", "y", "radius", "warning", "life"),
+    ...strings("id", "kind", "shape"),
+    ...numbers("x", "y", "radius", "warning", "life", "angle", "length", "innerRadius", "windup"),
   },
   "ShootingHazard",
 );
@@ -113,6 +113,11 @@ const Device = schema(
   { ...strings("id", "kind"), ...numbers("x", "y", "radius", "hp", "maxHp") },
   "ShootingDevice",
 );
+/** 공략의 공개 표현만 동기화하고 단계별 내부 판정·예약 콜백은 전송하지 않는다. */
+const MissionNode = schema({
+  ...strings("id", "kind", "label", "status"),
+  ...numbers("x", "y", "radius", "angle", "progress"),
+}, "ShootingMissionNode");
 export const WorldState = schema(
   {
     ...strings(
@@ -125,6 +130,8 @@ export const WorldState = schema(
       "title",
       "mapId",
       "nextMapId",
+      "objectiveText",
+      "objectiveHint",
     ),
     ...numbers(
       "stage",
@@ -143,8 +150,12 @@ export const WorldState = schema(
       "wave",
       "waveCount",
       "stars",
+      "objectiveStep",
+      "objectiveTotal",
+      "objectiveWindow",
     ),
-    ...booleans("paused", "privateRoom", "completed"),
+    ...booleans("paused", "privateRoom", "completed", "objectiveComplete"),
+    missionNodes: t.map(MissionNode),
     devices: t.map(Device),
     stageTimes: t.array("number"),
     players: t.map(Player),
@@ -182,7 +193,8 @@ const entityFields = {
   ],
   bullets: ["id", "weapon", "owner", "x", "y", "vx", "vy", "radius", "hostile"],
   pickups: ["id", "kind", "x", "y", "amount"],
-  hazards: ["id", "kind", "x", "y", "radius", "warning", "life"],
+  hazards: ["id", "kind", "shape", "x", "y", "radius", "warning", "life", "angle", "length", "innerRadius", "windup"],
+  missionNodes: ["id", "kind", "label", "status", "x", "y", "radius", "angle", "progress"],
   effects: ["id", "kind", "x", "y", "radius", "life", "value", "duration"],
   devices: ["id", "kind", "x", "y", "radius", "hp", "maxHp"],
 } as const;
@@ -255,6 +267,12 @@ export function synchronize(
     "wave",
     "waveCount",
     "paused",
+    "objectiveText",
+    "objectiveHint",
+    "objectiveStep",
+    "objectiveTotal",
+    "objectiveWindow",
+    "objectiveComplete",
   ] as const)
     root[name] = snapshot[name];
   for (const id of state.players.keys())
@@ -277,6 +295,7 @@ export function synchronize(
     hazards: Hazard,
     effects: Effect,
     devices: Device,
+    missionNodes: MissionNode,
   };
   for (const name of Object.keys(
     constructors,
@@ -292,7 +311,7 @@ export function synchronize(
       for (const field of entityFields[name])
         (row as unknown as Record<string, unknown>)[field] = (
           value as unknown as Record<string, unknown>
-        )[field];
+        )[field] ?? (field === "shape" ? "circle" : typeof (row as unknown as Record<string, unknown>)[field] === "string" ? "" : 0);
     }
   }
   if (state.stageTimes.length !== snapshot.stageTimes.length) {

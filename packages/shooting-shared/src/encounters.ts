@@ -1,27 +1,30 @@
 import type { EnemyKind } from "./index.ts";
+import type { StageMapId } from "./stages.ts";
+import { STAGE_MISSIONS } from "./missions.ts";
 
-/** 6개 맵이 같은 학습→응용→총력전 흐름을 공유하되 지형·장치·기본 몬스터는 각 맵을 따른다. */
+/** 학습→응용→총력전의 전투량 기준은 공유하고 실제 임무·파훼 순서는 맵별 레시피를 따른다. */
 export const ENCOUNTERS = [
-  { title: "회피의 시작", goal: "eliminate", enemies: 12, pack: 4, roles: ["charger", "shooter"], limit: 0 },
-  { title: "조준선을 끊어라", goal: "eliminate", enemies: 16, pack: 5, roles: ["sniper", "charger", "shield"], limit: 0 },
-  { title: "장치 제압", goal: "devices", enemies: 18, pack: 5, roles: ["shooter", "charger", "artillery"], limit: 0 },
-  { title: "지원망 돌파", goal: "eliminate", enemies: 16, pack: 5, roles: ["support", "shield", "sniper", "brute"], limit: 0 },
-  { title: "수호자의 시험", goal: "boss", enemies: 5, pack: 5, roles: ["support", "charger", "shooter"], limit: 0 },
-  { title: "양면 압박", goal: "eliminate", enemies: 22, pack: 6, roles: ["charger", "sniper", "skirmisher"], limit: 0 },
-  { title: "가동을 저지하라", goal: "disrupt", enemies: 20, pack: 6, roles: ["support", "artillery", "shield", "charger"], limit: 36 },
-  { title: "교차 포격", goal: "crossfire", enemies: 22, pack: 6, roles: ["sniper", "skirmisher", "brute"], limit: 0 },
-  { title: "총력전", goal: "eliminate", enemies: 28, pack: 7, roles: ["support", "sniper", "charger", "shield", "artillery"], limit: 0 },
-  { title: "최후의 공략", goal: "boss", enemies: 8, pack: 8, roles: ["support", "sniper", "charger"], limit: 0 },
+  { enemies: 12, pack: 4, roles: ["charger", "shooter"] },
+  { enemies: 16, pack: 5, roles: ["sniper", "charger", "shield"] },
+  { enemies: 18, pack: 5, roles: ["shooter", "charger", "artillery"] },
+  { enemies: 16, pack: 5, roles: ["support", "shield", "sniper", "brute"] },
+  { enemies: 5, pack: 5, roles: ["support", "charger", "shooter"] },
+  { enemies: 22, pack: 6, roles: ["charger", "sniper", "skirmisher"] },
+  { enemies: 20, pack: 6, roles: ["support", "artillery", "shield", "charger"] },
+  { enemies: 22, pack: 6, roles: ["sniper", "skirmisher", "brute"] },
+  { enemies: 28, pack: 7, roles: ["support", "sniper", "charger", "shield", "artillery"] },
+  { enemies: 8, pack: 8, roles: ["support", "sniper", "charger"] },
 ] as const satisfies readonly {
-  title: string;
-  goal: "eliminate" | "devices" | "disrupt" | "crossfire" | "boss";
   enemies: number;
   pack: number;
   roles: readonly EnemyKind[];
-  limit: number;
 }[];
 
-export const encounterFor = (stage: number) => ENCOUNTERS[Math.min(9, Math.max(0, stage - 1))];
+/** 맵 식별자를 반드시 받아 같은 번호의 다른 맵 임무가 섞이지 않게 한다. */
+export const encounterFor = (map: StageMapId, stage: number) => {
+  const index = Math.min(9, Math.max(0, stage - 1));
+  return { ...ENCOUNTERS[index], ...STAGE_MISSIONS[map][index] };
+};
 
 /** 발사 직전까지 추적하는 시간과 조준 고정 구간을 렌더러에서도 동일하게 표현한다. */
 export const ATTACK_READABILITY = { lockSeconds: 0.22, supportRadius: 235 } as const;

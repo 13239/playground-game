@@ -4,7 +4,10 @@ import {
   stageSpawn,
   BOSS_COMBAT,
   ATTACK_READABILITY,
+  hazardContains,
   movement,
+  terrainSpeed,
+  encounterFor,
   weaponStats,
   type GameSnapshot,
   type PlayerView,
@@ -15,6 +18,8 @@ import {
   type HazardView,
   type Rect,
   type StageDevice,
+  type MissionNodeView,
+  type StageMapId,
 } from "@playground/shooting-shared";
 import {
   Navigation,
@@ -49,8 +54,11 @@ interface HazardActor extends HazardView {
   damage: number;
   activated: boolean;
   sourceId?: string;
+  impact?: () => void;
 }
 export interface CombatHooks {
+  missionHit: (id: string, vx: number, vy: number, owner: string) => void;
+  bossPhase: () => void;
   state: GameSnapshot;
   random: () => number;
   nextId: () => string;
@@ -106,6 +114,13 @@ const guardianPatterns = {
   "boss-artillery": ["boss-mortar", "boss-fan"],
 } as const satisfies Partial<Record<EnemyKind, readonly EnemyAttack[]>>;
 
+/** 같은 원형 보스를 쓰는 후반 맵도 서로 다른 공격 순서를 가지며 프레임마다 설정 객체를 만들지 않는다. */
+const mapBossPatterns: Partial<Record<StageMapId, readonly EnemyAttack[]>> = {
+  DESERT: ["boss-charge", "boss-mortar", "boss-cleave"],
+  ICE: ["boss-burst", "boss-ring", "boss-crossfire"],
+  VOLCANO: ["boss-mortar", "boss-spiral", "boss-cleave"],
+};
+
 /** 전투 판정은 서버에서 고정 간격으로 수행한다. 네트워크 스키마와 Phaser 객체에 의존하지 않는다. */
 export class CombatWorld {
   private readonly enemies = new Map<string, EnemyActor>();
@@ -121,6 +136,44 @@ export class CombatWorld {
   private terrainClock = 0;
   private arenaClock = 0;
   private attackSlots = 0;
+
+  /** 공략 성공은 탄막 제거와 짧은 그로기로 즉시 보상한다. 성공 처리를 경험치로 반복 보상하지 않는다. */
+  openMissionWindow(): void {
+    this.ceaseFire();
+    for (const enemy of this.enemies.values()) {
+      enemy.cooldown = Math.max(enemy.cooldown, 1.2);
+      enemy.exposed = Math.max(enemy.exposed, 2);
+    }
+  }
+
+  /** 통합 위험 예산과 도달 가능한 회피 후보를 검사한 뒤 환경 공격을 예약한다. */
+  queueMissionHazard(value: Omit<HazardView, "id"> & { sourceId?: string; damage?: number }, impact?: () => void): boolean {
+    const players = Object.values(this.hooks.state.players).filter(p => p.alive && !p.departed);
+    const pending = [...this.hazards.values()].filter(h => h.warning > 0);
+    const strong = [...this.enemies.values()].filter(e => e.warning > 0 || e.charging > 0 || e.volleyRemaining > 0).length;
+    const budget = this.hooks.state.mode === "COOP" ? 4 : 3;
+    if (pending.length + strong >= budget) return false;
+    const arrival = value.warning;
+    const overlaps = pending.filter(h => Math.abs(h.warning - arrival) < 0.7);
+    for (const player of players) {
+      let safe = false;
+      for (let i = 0; i < 25; i++) {
+        const angle = (i % 12) * Math.PI / 6;
+        const slow = terrainSpeed(player.x, player.y, Object.values(this.hooks.state.devices));
+        const distance = i === 24 ? 0 : Math.min(230, 190 * slow * arrival) * (i < 12 ? 1 : 0.5);
+        const point = movement(player.x, player.y, Math.cos(angle) * distance, Math.sin(angle) * distance, WORLD.playerRadius, this.hooks.state.walls);
+        if (![value, ...overlaps].some(h => hazardContains(point, h, WORLD.playerRadius))) { safe = true; break; }
+      }
+      if (!safe) return false;
+    }
+    const hazard: HazardActor = {
+      ...value, id: this.hooks.nextId(), damage: value.damage ?? 30 + this.hooks.state.stage * 2.4,
+      activated: false, impact,
+    };
+    this.hazards.set(hazard.id, hazard);
+    this.hooks.state.hazards[hazard.id] = hazard;
+    return true;
+  }
 
   constructor(hooks: CombatHooks) {
     this.hooks = hooks;
@@ -237,10 +290,11 @@ export class CombatWorld {
         this.hooks.effect("enemy-explosion", hazard.x, hazard.y, hazard.radius);
         for (const player of targets)
           if (
-            distanceSquared(player, hazard) <=
-            (hazard.radius + WORLD.playerRadius) ** 2
+            hazardContains(player, hazard, WORLD.playerRadius) &&
+            !Object.values(this.hooks.state.missionNodes).some(node => node.kind === "shelter" && distanceSquared(player, node) < (node.radius - WORLD.playerRadius) ** 2)
           )
             this.hooks.hitPlayer(player, hazard.damage);
+        hazard.impact?.();
       }
       if (hazard.activated) hazard.life -= dt;
       if (hazard.life <= 0) {
@@ -252,36 +306,44 @@ export class CombatWorld {
 
   /** 용암은 전투 시간으로만 진행한다. 예고 후 한 번만 피해를 주고 장치를 부수면 예약된 분출도 취소한다. */
   private advanceTerrain(dt: number): void {
-    // 8스테이지는 맵 고유 기믹 위에 교차 포격을 얹는다. 매번 미리 정해진 위치를 충분히 예고한다.
-    if (this.hooks.state.stage === 8) {
-      this.arenaClock += dt;
-      if (this.arenaClock >= 4.2) {
-        this.arenaClock %= 4.2;
-        const cycle = Math.floor(this.hooks.state.stageMillis / 4200);
-        const points = cycle % 2 ? [[440, 380], [1160, 580]] : [[440, 580], [1160, 380]];
-        for (const [x, y] of points) {
-          const id = this.hooks.nextId();
-          const hazard: HazardActor = { id, x, y, radius: 105, warning: 1.1, life: 0.35, kind: "crossfire", damage: 52, activated: false };
-          this.hazards.set(id, hazard);
-          this.hooks.state.hazards[id] = hazard;
-        }
-      }
-    }
+    this.advanceMapPressure(dt);
+    // 8스테이지도 맵 고유 기믹 위에 각 맵의 압박 패턴을 얹는다. 모든 위치를 충분히 예고한다.
     if (this.hooks.state.mapId !== "VOLCANO") return;
     this.terrainClock += dt;
     if (this.terrainClock < 4.8) return;
     this.terrainClock %= 4.8;
     for (const device of Object.values(this.hooks.state.devices)) {
       if (device.kind !== "lava-vent" || device.hp <= 0) continue;
-      const id = this.hooks.nextId();
-      const hazard: HazardActor = {
-        id, x: device.x, y: device.y, radius: 155, warning: 1.2, life: 0.45,
+      this.queueMissionHazard({
+        x: device.x, y: device.y, radius: 155, warning: 1.2, windup: 1.2, life: 0.45,
         kind: "lava", damage: 18 + this.hooks.state.stage * 1.8,
-        activated: false, sourceId: device.id,
-      };
-      this.hazards.set(id, hazard);
-      this.hooks.state.hazards[id] = hazard;
+        sourceId: device.id,
+      });
     }
+  }
+
+  /** 같은 번호라도 맵마다 고리·광선·발밑 예고의 조합과 간격이 달라진다. 예고 중에는 범위를 고정한다. */
+  private advanceMapPressure(dt: number): void {
+    this.arenaClock += dt;
+    const state = this.hooks.state;
+    const interval = Math.max(2.9, 5.3 - state.stage * 0.17 - (state.bossName ? 0.4 : 0));
+    if (this.arenaClock < interval) return;
+    const targets = Object.values(state.players).filter(p => p.alive && !p.departed);
+    if (!targets.length) return;
+    const cycle = Math.floor(state.stageMillis / (interval * 1000));
+    const target = targets[cycle % targets.length];
+    const base = { x: target.x, y: target.y, radius: 95, warning: 1.2, windup: 1.2, life: 0.35, kind: "map-pressure", shape: "circle" };
+    let value: Omit<HazardView, "id"> = base;
+    switch (encounterFor(state.mapId, state.stage).pressure) {
+      case "rocks": value = { ...base, x: Math.max(130, Math.min(1470, target.x + target.vx * 0.35)), y: Math.max(130, Math.min(830, target.y + target.vy * 0.35)), radius: 112, kind: "cave-rock" }; break;
+      case "laser": value = { ...base, shape: "line", length: 1050, radius: 38, angle: cycle * Math.PI / 4, kind: "factory-laser" }; break;
+      case "pollen": value = { ...base, shape: "ring", radius: cycle % 2 ? 220 : 105, innerRadius: cycle % 2 ? 125 : 0, warning: 1.3, windup: 1.3, kind: "garden-bloom" }; break;
+      case "sand": value = { ...base, shape: cycle % 2 ? "line" : "circle", length: 900, radius: cycle % 2 ? 52 : 115, angle: cycle % 2 ? Math.PI / 2 : 0, kind: "desert-burrow" }; break;
+      case "frost": value = { ...base, shape: "line", length: 950, radius: 42, angle: cycle % 2 ? Math.PI / 4 : -Math.PI / 4, warning: 1.5, windup: 1.5, kind: "ice-fracture" }; break;
+      case "magma": value = { ...base, shape: cycle % 2 ? "ring" : "circle", radius: cycle % 2 ? 240 : 120, innerRadius: cycle % 2 ? 140 : 0, kind: "volcano-pressure" }; break;
+    }
+    if (this.queueMissionHazard(value)) this.arenaClock = 0;
+    else this.arenaClock = interval - 0.35;
   }
 
   fire(player: PlayerView, firing: boolean, dt: number): void {
@@ -345,6 +407,8 @@ export class CombatWorld {
   ): void {
     if (enemy.hp <= 0) return;
     enemy.exposed = Math.max(0, enemy.exposed - dt);
+    // 보스의 금색 약점 표시는 공략으로 확보한 전체 공격 시간과 일치한다.
+    if (enemy.boss) enemy.exposed = this.hooks.state.objectiveComplete ? Math.max(enemy.exposed, this.hooks.state.objectiveWindow) : 0;
     enemy.spawnRemaining = Math.max(0, enemy.spawnRemaining - dt);
     if (enemy.spawnRemaining > 0 || players.length === 0) return;
     // 최종 보스는 65%·35%에서 지원 분대를 호출한다. 한 단계당 두 명만 추가하며 총 처치 수에도 반영한다.
@@ -352,6 +416,7 @@ export class CombatWorld {
       const phase = enemy.hp <= enemy.maxHp * BOSS_COMBAT.finalPhaseHealth
         ? 3
         : enemy.hp <= enemy.maxHp * BOSS_COMBAT.secondPhaseHealth ? 2 : 1;
+      const previousPhase = enemy.combatPhase;
       while (enemy.combatPhase < phase) {
         enemy.combatPhase++;
         this.hooks.state.enemyTotal += 2;
@@ -359,6 +424,8 @@ export class CombatWorld {
         this.spawn("charger", enemy.combatPhase === 3);
         this.hooks.effect("boss-phase", enemy.x, enemy.y, 100, enemy.combatPhase);
       }
+      // 체력 경계를 넘은 바로 이 틱에 방어를 복구해 고화력·동시 탄환의 단계 건너뛰기를 막는다.
+      if (previousPhase !== enemy.combatPhase) this.hooks.bossPhase();
     }
     const target = players.reduce((best, p) =>
       distanceSquared(enemy, p) < distanceSquared(enemy, best) ? p : best,
@@ -520,9 +587,11 @@ export class CombatWorld {
         enemy.targetX = target.x;
         enemy.targetY = target.y;
         if (enemy.boss) {
-          const patterns = (
+          const basePatterns = (
             this.hooks.state.stage === 5 ? guardianPatterns : bossPatterns
           )[enemy.kind as keyof typeof bossPatterns];
+          const selected = mapBossPatterns[this.hooks.state.mapId];
+          const patterns = selected ? selected.slice(0, this.hooks.state.stage === 5 ? 2 : 3) : basePatterns;
           enemy.attack = patterns[(enemy.attackCycle++ + enemy.combatPhase - 1) % patterns.length];
           enemy.warning = enemy.attack === "boss-charge" ? 0.95 : 0.8;
         } else {
@@ -710,10 +779,8 @@ export class CombatWorld {
     this.hooks.effect("enemy-shot", enemy.x, enemy.y, enemy.radius + 12, angle);
   }
   private artillery(enemy: EnemyActor, x: number, y: number): void {
-    const id = this.hooks.nextId();
     const radius = enemy.boss ? 90 : 76;
-    const hazard: HazardActor = {
-      id,
+    this.queueMissionHazard({
       // 경계에서도 원 전체와 예고가 보이도록 실제 판정 위치를 함께 제한한다.
       x: Math.max(
         WORLD.border + radius,
@@ -725,13 +792,11 @@ export class CombatWorld {
       ),
       radius,
       warning: 0.9,
+      windup: 0.9,
       life: 0.3,
       kind: this.hooks.state.mapId === "GARDEN" ? "spore" : "artillery",
       damage: enemy.damage * 1.25,
-      activated: false,
-    };
-    this.hazards.set(id, hazard);
-    this.hooks.state.hazards[id] = hazard;
+    });
   }
 
   private createBullet(value: Omit<BulletActor, "id" | "hit">): void {
@@ -765,7 +830,7 @@ export class CombatWorld {
         dx = (bullet.vx / speed) * remaining,
         dy = (bullet.vy / speed) * remaining;
       let fraction = 1.001,
-        target: EnemyActor | PlayerView | StageDevice | undefined,
+        target: EnemyActor | PlayerView | StageDevice | MissionNodeView | undefined,
         wall = false;
       for (const item of this.collisionWalls) {
         const hit = segmentRect(
@@ -813,6 +878,12 @@ export class CombatWorld {
         }
       }
       if (!bullet.hostile) {
+        // 공략 노드는 일반 장치의 체력·폭발 경로와 분리한다. 발사점·운반물은 탄환을 막지 않는다.
+        for (const node of Object.values(this.hooks.state.missionNodes)) {
+          if (!["reflect", "circuit", "prune", "pulse", "resonate", "wind", "mirage", "minus", "plus"].includes(node.kind) || node.status === "done") continue;
+          const at = segmentCircle(bullet.x, bullet.y, dx, dy, node, node.radius + bullet.radius);
+          if (at !== undefined && at < fraction) { fraction = at; target = node; wall = false; }
+        }
         for (const device of Object.values(this.hooks.state.devices)) {
           if (device.hp <= 0 || bullet.hit.has(device.id)) continue;
           const at = segmentCircle(
@@ -848,6 +919,11 @@ export class CombatWorld {
           return;
         }
         if (!("boss" in target)) {
+          if ("status" in target) {
+            this.hooks.missionHit(target.id, bullet.vx, bullet.vy, bullet.owner);
+            this.removeBullet(bullet, false);
+            return;
+          }
           this.damageDevice(target as StageDevice, bullet.damage);
           this.removeBullet(bullet, true);
           return;
@@ -974,6 +1050,8 @@ export class CombatWorld {
   private damageEnemy(enemy: EnemyActor, damage: number): void {
     if (!this.enemies.has(enemy.id) || enemy.hp <= 0) return;
     const state = this.hooks.state;
+    // 필수 공략을 생략한 화력 처치를 차단한다. 일반 몬스터는 평소처럼 공격할 수 있다.
+    if (enemy.boss && !state.objectiveComplete) return;
     const powered = Object.values(state.devices).some(
       (d) =>
         d.hp > 0 &&
@@ -987,7 +1065,11 @@ export class CombatWorld {
     );
     const multiplier = enemy.exposed > 0 ? 2.2 : powered ? 0.45 : supported ? 0.55 : 1;
     const actual = damage * multiplier;
-    enemy.hp = Math.max(0, enemy.hp - actual);
+    const floor = enemy.boss && state.stage === 10
+      ? enemy.combatPhase === 1 ? enemy.maxHp * BOSS_COMBAT.secondPhaseHealth
+        : enemy.combatPhase === 2 ? enemy.maxHp * BOSS_COMBAT.finalPhaseHealth : 0
+      : 0;
+    enemy.hp = Math.max(floor, enemy.hp - actual);
     this.hooks.effect(
       "hit",
       enemy.x,
